@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::Networking::WinHttp::*;
 
 /// `GET /releases/latest` for the clip repository. Anonymous, read-only.
@@ -293,7 +294,9 @@ fn resolve_redirect(base: &str, location: &str) -> Option<String> {
     if loc.is_empty() {
         return None;
     }
-    if loc.starts_with("https://") || loc.starts_with("http://") {
+    if loc.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        || loc.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+    {
         return Some(loc.to_string());
     }
     let parts = split_url(base)?;
@@ -339,9 +342,31 @@ struct HttpResponse {
 
 /// Reads one response header as text (`WINHTTP_QUERY_*` info level).
 unsafe fn query_header(req: *mut std::ffi::c_void, level: u32) -> Option<String> {
-    let mut buf = [0u16; 512];
-    let mut len = (buf.len() * std::mem::size_of::<u16>()) as u32;
+    // GitHub's signed release asset `Location` redirects routinely exceed 512 chars (~900 bytes);
+    // probe the header size first instead of silently dropping long headers on
+    // `ERROR_INSUFFICIENT_BUFFER`.
+    const MAX_HEADER_BYTES: u32 = 64 * 1024;
+    let mut len = 0u32;
     let mut index = 0u32;
+    if let Err(err) = WinHttpQueryHeaders(
+        req,
+        level,
+        PCWSTR::null(),
+        None,
+        &mut len,
+        &mut index,
+    ) {
+        if err.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult() {
+            return None;
+        }
+    }
+    if len == 0 || len > MAX_HEADER_BYTES {
+        return None;
+    }
+
+    let cap = (len as usize).div_ceil(std::mem::size_of::<u16>());
+    let mut buf = vec![0u16; cap];
+    index = 0;
     WinHttpQueryHeaders(
         req,
         level,
@@ -881,6 +906,15 @@ pub fn cleanup_old_exe(current_exe: &Path) {
     let _ = std::fs::remove_file(new_exe_path(current_exe));
 }
 
+/// Removes `clip.exe.old`, returning `true` when it is absent or deleted.
+pub fn cleanup_backup_exe(current_exe: &Path) -> bool {
+    match std::fs::remove_file(old_exe_path(current_exe)) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // UI-facing status
 // ---------------------------------------------------------------------------------------------
@@ -1185,6 +1219,10 @@ mod tests {
             "https://objects.githubusercontent.com/github-production-release-asset/1/clip.exe",
             false
         ));
+        assert!(is_allowed_download_url(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1464774055/clip.exe?sig=abc",
+            false
+        ));
         assert!(is_allowed_download_url("https://github.com", false));
     }
 
@@ -1230,6 +1268,11 @@ mod tests {
             resolve_redirect("https://api.github.com/repos/x/y", "https://objects.githubusercontent.com/a")
                 .as_deref(),
             Some("https://objects.githubusercontent.com/a")
+        );
+        assert_eq!(
+            resolve_redirect("https://github.com/a", "HTTPS://release-assets.githubusercontent.com/b")
+                .as_deref(),
+            Some("HTTPS://release-assets.githubusercontent.com/b")
         );
         assert_eq!(resolve_redirect("https://github.com/a", ""), None);
     }
@@ -1552,6 +1595,34 @@ mod tests {
         let fetched: Vec<String> = server.requests().into_iter().map(|(path, _)| path).collect();
         assert_eq!(fetched, vec!["/rel".to_string(), "/bin".to_string()]);
         assert!(!dir.join(NEW_EXE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_follows_long_redirect_location_past_512_chars() {
+        let bytes = fake_exe("long-redirect");
+        let served = bytes.clone();
+        let long_sig = "a".repeat(1_200);
+        let long_target = format!("/bin?sp=r&sv=2025-05-05&sig={long_sig}");
+        let server_target = long_target.clone();
+        let server = MockServer::start(move |path, _| match path {
+            "/rel" => MockResponse::new(302, "").header("Location", server_target.clone()),
+            p if p == server_target => MockResponse::new(200, served.clone()),
+            _ => MockResponse::new(404, ""),
+        });
+        assert!(server.url(&long_target).len() > 1_200);
+
+        let dir = temp_dir("long-redirect");
+        let current = dir.join("clip.exe");
+        std::fs::write(&current, b"MZ old build").unwrap();
+
+        let info = update_info(&server.url("/rel"), &bytes);
+        let version = download_and_apply_update(&current, &info, true).unwrap();
+
+        assert_eq!(version, "0.1.1");
+        assert_eq!(std::fs::read(&current).unwrap(), bytes);
+        let fetched: Vec<String> = server.requests().into_iter().map(|(path, _)| path).collect();
+        assert_eq!(fetched, vec!["/rel".to_string(), long_target]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

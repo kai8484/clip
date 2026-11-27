@@ -2585,6 +2585,7 @@ fn perform_update_check(app: &AppHandle, shared: &AppShared, manual: bool) -> up
 fn apply_update_blocking(
     app: &AppHandle,
     shared: &AppShared,
+    current_exe: &std::path::Path,
 ) -> Result<update::UpdateStatus, String> {
     let info = {
         let mut st = shared.0.lock().unwrap();
@@ -2604,9 +2605,7 @@ fn apply_update_blocking(
     };
     emit_update_status(app, shared);
 
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
-    let outcome = update::download_and_apply_update(&current_exe, &info, false);
+    let outcome = update::download_and_apply_update(current_exe, &info, false);
 
     let status = {
         let mut st = shared.0.lock().unwrap();
@@ -2680,16 +2679,20 @@ async fn apply_update(
     state: State<'_, AppShared>,
 ) -> Result<update::UpdateStatus, String> {
     let shared = state.inner().clone();
+    // Resolve before `swap_exe_files` renames the running image to `clip.exe.old`.
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
     let status = {
         let app = app.clone();
         let shared = shared.clone();
-        tauri::async_runtime::spawn_blocking(move || apply_update_blocking(&app, &shared))
-            .await
-            .map_err(|e| format!("Update failed: {e}"))?
+        let current_exe = current_exe.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            apply_update_blocking(&app, &shared, &current_exe)
+        })
+        .await
+        .map_err(|e| format!("Update failed: {e}"))?
     }?;
 
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
     // Launch first: the new copy retries the instance mutex for a moment, so this copy can
     // release it right after and exit without a handoff race.
     std::process::Command::new(&current_exe)
@@ -2773,6 +2776,18 @@ fn main() {
     // Only this process owns clip.exe now, so leftovers from an interrupted update are stale.
     if let Ok(current_exe) = std::env::current_exe() {
         update::cleanup_old_exe(&current_exe);
+        if launched_updated {
+            // The previous copy sleeps ~150 ms before shutting down, so retry removing its
+            // renamed `clip.exe.old` once it releases the image lock.
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    if update::cleanup_backup_exe(&current_exe) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            });
+        }
     }
 
     // No `data\config.json` next to the executable yet: show the install wizard and write
