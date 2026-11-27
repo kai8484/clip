@@ -318,6 +318,7 @@ test("upload then public fetch serves the clip, page and thumb", async () => {
   const html = await pageRes.text();
   assert.match(html, /<video /);
   assert.match(html, /https:\/\/clips\.test\/one\.mp4/);
+  assert.match(html, /DOWNLOCK CLIP SOFTWARE HERE/);
 
   const thumbUpload = await worker.fetch(
     new Request("https://clips.test/upload/one.png", {
@@ -332,6 +333,29 @@ test("upload then public fetch serves the clip, page and thumb", async () => {
   const thumbRes = await get(bucket, "/one.png");
   assert.equal(thumbRes.status, 200);
   assert.equal(thumbRes.headers.get("Content-Type"), "image/png");
+});
+
+test("the clip page puts the DOWNLOCK CTA above the video", async () => {
+  const bucket = new MockBucket();
+  await upload(bucket, "cta", mp4Body("cta"));
+
+  const pageRes = await get(bucket, "/cta");
+  assert.equal(pageRes.status, 200);
+  const html = await pageRes.text();
+
+  const linkRe =
+    /<a class="cta" href="https:\/\/github\.com\/kai8484\/clip" target="_blank" rel="noopener noreferrer">DOWNLOCK CLIP SOFTWARE HERE<\/a>/;
+  const linkMatch = html.match(linkRe);
+  assert.ok(linkMatch, "CTA link with exact label, href and rel should be rendered");
+
+  const videoIndex = html.indexOf("<video ");
+  assert.ok(videoIndex > -1, "page should still render the video element");
+  assert.ok(linkMatch.index < videoIndex, "CTA link must come before the video element");
+
+  // The surrounding page contract must survive the extra markup.
+  assert.match(html, /<meta property="og:video" content="https:\/\/clips\.test\/cta\.mp4" \/>/);
+  assert.match(html, /<script id="discord:component-embed" type="application\/json">/);
+  assert.match(html, /Download MP4<\/a>/);
 });
 
 test("upload requires the right key", async () => {

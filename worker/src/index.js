@@ -1,3 +1,4 @@
+const REPO_URL = "https://github.com/kai8484/clip";
 const SLUG_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
 const MAX_THUMB_BYTES = 2 * 1024 * 1024;
@@ -598,10 +599,45 @@ async function handlePage(request, env, url, slug) {
   <meta property="og:video" content="${escVideoUrl}" />
   <meta property="og:video:secure_url" content="${escVideoUrl}" />
   <meta property="og:video:type" content="video/mp4" />
-${ogDimTags}${ogThumbTags}${componentEmbedTag}</head>
+${ogDimTags}${ogThumbTags}${componentEmbedTag}  <style>
+    .cta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-height: 64px;
+      padding: 18px 26px;
+      box-sizing: border-box;
+      background: #45D6CC;
+      color: #080E14;
+      font-size: clamp(16px, 2.4vw, 22px);
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-align: center;
+      text-decoration: none;
+      border-radius: 10px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(69, 214, 204, 0.35);
+      transition: background 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+    .cta:hover {
+      background: #6EE3DB;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(69, 214, 204, 0.6);
+    }
+    .cta:active {
+      background: #35BDB4;
+      transform: translateY(1px);
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+    }
+    .cta:focus-visible {
+      outline: 3px solid #F2F8FA;
+      outline-offset: 3px;
+    }
+  </style>
+</head>
 <body style="margin:0;min-height:100vh;background:#111B24;color:#F2F8FA;font-family:system-ui,-apple-system,Segoe UI,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;">
   <main style="width:100%;max-width:960px;display:flex;flex-direction:column;gap:12px;">
-    <video controls playsinline preload="metadata"${thumbUrl ? ` poster="${escapeHtml(thumbUrl)}"` : ""} src="${escVideoUrl}" style="width:100%;max-height:82vh;border-radius:6px;background:#080E14;border:0;"></video>
+    <a class="cta" href="${REPO_URL}" target="_blank" rel="noopener noreferrer">DOWNLOCK CLIP SOFTWARE HERE</a>
+    <video controls playsinline preload="metadata"${thumbUrl ? ` poster="${escapeHtml(thumbUrl)}"` : ""} src="${escVideoUrl}" style="width:100%;max-height:min(74vh,calc(100vh - 170px));border-radius:6px;background:#080E14;border:0;"></video>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;color:#9CB6C5;">
       <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escTitle}</span>
       <a href="${escVideoUrl}" download="${escapeHtml(slug)}.mp4" style="color:#45D6CC;text-decoration:none;font-weight:600;white-space:nowrap;">Download MP4</a>
