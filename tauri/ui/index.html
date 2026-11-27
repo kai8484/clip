@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>clip</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Custom frameless titlebar: draggable, tabs on left, window controls on right -->
+    <header class="titlebar glass-bar" data-tauri-drag-region="deep">
+      <nav class="tabs" role="tablist">
+        <button id="tab-clips" class="tab-btn tab-icon-btn is-active" type="button" role="tab" aria-selected="true" title="Clips" aria-label="Clips">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z" />
+          </svg>
+        </button>
+        <button id="tab-settings" class="tab-btn tab-icon-btn" type="button" role="tab" aria-selected="false" title="Settings" aria-label="Settings">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
+          </svg>
+        </button>
+      </nav>
+      <div class="titlebar-actions">
+        <div class="window-controls">
+          <button id="win-min" class="win-btn" type="button" title="Minimize" aria-label="Minimize">
+            <svg viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M2.5 6H9.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+            </svg>
+          </button>
+          <button id="win-close" class="win-btn win-close" type="button" title="Close to tray" aria-label="Close">
+            <svg viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M3 3L9 9M9 3L3 9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Clips sub-bar: attached directly below the top bar when Clips tab is active -->
+    <div id="clips-toolbar" class="clips-toolbar glass-bar">
+      <div class="clips-toolbar-left">
+        <span id="clips-summary" class="clips-summary">0 clips</span>
+      </div>
+      <div id="clips-actions-normal" class="clips-toolbar-actions">
+        <button id="btn-clips-select" class="btn btn-secondary btn-xs" type="button">Select</button>
+        <button id="btn-clips-open-folder" class="btn btn-secondary btn-xs" type="button" title="Open clips folder in File Explorer">Open folder</button>
+      </div>
+      <div id="clips-actions-select" class="clips-toolbar-actions is-hidden">
+        <button id="btn-clips-select-all" class="btn btn-secondary btn-xs" type="button">Select all</button>
+        <button id="btn-clips-delete-bulk" class="btn btn-danger-solid btn-xs" type="button" disabled>Delete</button>
+        <button id="btn-clips-cancel-select" class="btn btn-secondary btn-xs" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Main workspace -->
+    <main class="workspace">
+      <div class="content-scroll is-clips-tab">
+        <!-- Clips Gallery Page -->
+        <section id="page-clips" class="page clips-page is-visible" aria-labelledby="tab-clips">
+          <div id="clips-empty" class="glass-card clips-empty is-hidden">
+            <svg class="clips-empty-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <rect x="2.5" y="4.5" width="19" height="15" rx="2" stroke="currentColor" stroke-width="1.5" />
+              <path d="M10 9L15.5 12L10 15V9Z" fill="currentColor" />
+            </svg>
+            <div class="clips-empty-title">No clips yet</div>
+            <div id="clips-empty-hint" class="clips-empty-hint">Press F9 while playing to save a clip.</div>
+            <button id="btn-clips-empty-folder" class="btn btn-secondary btn-sm" type="button">Open clips folder</button>
+          </div>
+
+          <div id="clips-grid" class="clips-grid"></div>
+        </section>
+
+        <!-- Settings Page: capture, audio, app and sharing -->
+        <section id="page-settings" class="page" aria-labelledby="tab-settings">
+          <!-- Hotkey + clip length -->
+          <div class="pill-grid pill-grid-hotkey-len">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Global shortcut that saves the last seconds as a clip">Hotkey</div>
+                <div class="pill-control space-between-control">
+                  <div class="hotkey-control">
+                    <button id="btn-hotkey" class="keycap" type="button" title="Click to change shortcut">F9</button>
+                  </div>
+                  <button id="btn-change-hotkey" class="btn btn-secondary btn-sm" type="button">Change</button>
+                </div>
+              </div>
+              <span id="hotkey-hint" class="hint-text is-hidden">Esc cancels · Ctrl/Shift/Alt ok</span>
+              <div id="hotkey-note" class="danger-note is-hidden"></div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="How much gets saved before you press the shortcut">Clip length</div>
+                <div class="pill-control slider-control">
+                  <input id="slider-seconds" class="range-input" type="range" min="5" max="300" step="5" value="30" />
+                  <span id="val-seconds" class="slider-value">30 s</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Bitrate + codec -->
+          <div class="pill-grid pill-grid-bitrate-codec">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Target video bitrate in Mbps — higher means a sharper image and larger clips">Bitrate</div>
+                <div class="pill-control slider-control">
+                  <input id="slider-bitrate" class="range-input" type="range" min="2" max="150" step="1" value="16" />
+                  <span id="val-bitrate" class="slider-value">16 Mbps</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="HEVC (H.265) gives smaller files at the same quality; H.264 plays everywhere">Codec</div>
+                <div class="pill-control">
+                  <div id="seg-codec" class="segmented" role="group" aria-label="Video codec">
+                    <button class="seg-btn is-active" type="button" data-codec="h264">H.264</button>
+                    <button class="seg-btn" type="button" data-codec="hevc">HEVC</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Frame rate + resolution -->
+          <div class="pill-grid pill-grid-2">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="MP4 video: plays on Windows, iOS, Android and Discord">Frame rate</div>
+                <div class="pill-control">
+                  <div id="seg-fps" class="segmented" role="group" aria-label="Frame rate">
+                    <button class="seg-btn" type="button" data-fps="30">30</button>
+                    <button class="seg-btn is-active" type="button" data-fps="60">60</button>
+                    <button class="seg-btn" type="button" data-fps="120">120</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Downscale 1440p/4K captures to save space; never upscales smaller monitors">Resolution</div>
+                <div class="pill-control">
+                  <div id="seg-res" class="segmented" role="group" aria-label="Resolution">
+                    <button class="seg-btn is-active" type="button" data-height="0">Native</button>
+                    <button class="seg-btn" type="button" data-height="1080">1080p</button>
+                    <button class="seg-btn" type="button" data-height="720">720p</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Folder -->
+          <div class="glass-card pill-row">
+            <div class="pill-label" title="Where saved clips are stored">Folder</div>
+            <div class="pill-control path-control">
+              <span id="txt-output-dir" class="path-text" title=""></span>
+              <button id="btn-change-folder" class="btn btn-secondary btn-sm" type="button">Change</button>
+            </div>
+          </div>
+
+          <!-- Capture mode + estimated clip size -->
+          <div class="pill-grid pill-grid-capture-size">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Record only while a fullscreen game is running, or continuously record the screen">Capture</div>
+                <div class="pill-control">
+                  <div id="seg-capture" class="segmented" role="group" aria-label="Capture mode">
+                    <button class="seg-btn is-active" type="button" data-capture="games">Games only</button>
+                    <button class="seg-btn" type="button" data-capture="screen">Screen</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Approximate MP4 file size at your selected clip length and bitrate">Est. clip size</div>
+                <div class="pill-control right-control">
+                  <span id="val-est-size" class="body-text">~113 MB</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-spacer"></div>
+
+          <!-- Audio -->
+          <div class="audio-grid">
+            <div class="glass-card audio-pill">
+              <div class="audio-head">
+                <span class="audio-title" title="The fullscreen game, detected automatically. When none is running, all audio goes here">Game</span>
+                <label class="toggle" title="Toggle game audio">
+                  <input id="chk-game-audio" type="checkbox" />
+                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                </label>
+              </div>
+              <div class="slider-control" id="wrap-game-vol">
+                <input id="slider-game-vol" class="range-input" type="range" min="0" max="100" step="1" value="100" />
+                <span id="val-game-vol" class="slider-value slider-value-sm">100 %</span>
+              </div>
+            </div>
+
+            <div class="glass-card audio-pill">
+              <div class="audio-head">
+                <span class="audio-title" title="Everything else: Discord, music, browser">Desktop</span>
+                <label class="toggle" title="Toggle desktop audio">
+                  <input id="chk-desktop-audio" type="checkbox" />
+                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                </label>
+              </div>
+              <div class="slider-control" id="wrap-desktop-vol">
+                <input id="slider-desktop-vol" class="range-input" type="range" min="0" max="100" step="1" value="100" />
+                <span id="val-desktop-vol" class="slider-value slider-value-sm">100 %</span>
+              </div>
+            </div>
+
+            <div class="glass-card audio-pill">
+              <div class="audio-head">
+                <span class="audio-title" title="Records your voice into the clip. You can also toggle it from the tray icon">Microphone</span>
+                <label class="toggle" title="Toggle microphone audio">
+                  <input id="chk-mic-audio" type="checkbox" />
+                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                </label>
+              </div>
+              <div class="slider-control" id="wrap-mic-vol">
+                <input id="slider-mic-vol" class="range-input" type="range" min="0" max="200" step="1" value="100" />
+                <span id="val-mic-vol" class="slider-value slider-value-sm">100 %</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Input device picker (when mic on) -->
+          <div id="row-mic-device" class="glass-card pill-row is-hidden">
+            <div class="pill-label" title="Select which microphone to record">Input device</div>
+            <div class="pill-control mic-control">
+              <select id="sel-mic-device" class="select-input" title="Select microphone"></select>
+              <button id="btn-refresh-mics" class="btn btn-secondary btn-sm" type="button" title="Search for connected microphones">Refresh</button>
+            </div>
+          </div>
+
+          <div class="section-spacer"></div>
+
+          <!-- Sound on save + Start with Windows -->
+          <div class="pill-grid pill-grid-sound-auto">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Plays a short sound when a clip is saved">Sound on save</div>
+                <div class="pill-control">
+                  <div class="slider-control" id="wrap-sound-vol">
+                    <input id="slider-sound-vol" class="range-input" type="range" min="0" max="100" step="1" value="100" />
+                    <span id="val-sound-vol" class="slider-value slider-value-sm">100 %</span>
+                  </div>
+                  <button id="btn-test-sound" class="btn btn-secondary btn-sm" type="button">Test sound</button>
+                  <label class="toggle">
+                    <input id="chk-sound-on-save" type="checkbox" />
+                    <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Starts the recorder in the tray when you sign in">Start with Windows</div>
+                <div class="pill-control right-control">
+                  <label class="toggle">
+                    <input id="chk-autostart" type="checkbox" />
+                    <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Clip sharing (Cloudflare Worker + R2) -->
+          <div class="pill-grid pill-grid-share">
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Worker domain used to host and embed shared clips (e.g. https://clips.example.com)">Share URL</div>
+                <div class="pill-control">
+                  <input id="inp-share-url" class="text-input share-input" type="url" autocomplete="off" spellcheck="false" placeholder="https://clips.yourdomain.com" />
+                </div>
+              </div>
+            </div>
+
+            <div class="glass-card pill-stack">
+              <div class="pill-row-inner">
+                <div class="pill-label" title="Secret UPLOAD_KEY configured on your Cloudflare Worker">Upload key</div>
+                <div class="pill-control share-key-control">
+                  <input id="inp-share-key" class="text-input share-input" type="password" autocomplete="off" spellcheck="false" placeholder="Secret upload key" />
+                  <button id="btn-toggle-share-key" class="btn btn-secondary btn-sm" type="button">Show</button>
+                  <button id="btn-clear-share-key" class="btn btn-secondary btn-sm" type="button" title="Remove the saved upload key" disabled>Clear</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Data and logs -->
+          <div class="glass-card pill-row">
+            <div class="pill-label" title="config.json, clip.log and the clip cache, next to the exe">Data and logs</div>
+            <div class="pill-control path-control">
+              <span id="txt-app-dir" class="path-text" title=""></span>
+              <button id="btn-open-data" class="btn btn-secondary btn-icon" type="button" title="Open folder" aria-label="Open data folder">
+                <svg class="icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M1.5 3.5H6L7.5 5.2H14.5V12.5H1.5V3.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <button id="btn-quit" class="btn btn-danger btn-sm" type="button">Quit clip</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Toast notifications -->
+      <div id="toast-area" class="toast-area" aria-live="polite"></div>
+    </main>
+
+    <!-- Bottom status bar -->
+    <footer class="status-bar glass-bar">
+      <div class="status-left">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-text" class="status-text">Recording</span>
+        <label id="status-toggle-wrap" class="toggle toggle-sm" title="Pause or resume recording">
+          <input id="chk-status-enabled" type="checkbox" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        </label>
+        <button id="btn-start-recorder" class="btn btn-primary btn-xs is-hidden" type="button">Start recorder</button>
+        <span id="status-hotkey-hint" class="status-muted"></span>
+      </div>
+      <div class="status-right">
+        <span id="status-meta" class="status-muted">0 clips</span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Clip context menu -->
+  <div id="clip-context-menu" class="context-menu is-hidden" role="menu"></div>
+
+  <!-- Rename clip modal -->
+  <div id="modal-rename-clip" class="modal-scrim is-hidden" role="dialog" aria-modal="true" aria-labelledby="modal-rename-title">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div id="modal-rename-title" class="modal-title">Rename clip</div>
+          <div id="rename-clip-subtitle" class="modal-subtitle"></div>
+        </div>
+        <button id="btn-rename-x" class="modal-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="rename-input-row">
+          <input id="inp-rename-clip" class="text-input" type="text" autocomplete="off" spellcheck="false" />
+          <span id="rename-clip-ext" class="rename-ext">.mp4</span>
+        </div>
+        <div id="rename-clip-error" class="danger-note rename-error is-hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-rename-cancel" class="btn btn-secondary" type="button">Cancel</button>
+        <button id="btn-rename-save" class="btn btn-primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete clips confirmation modal -->
+  <div id="modal-delete-clips" class="modal-scrim is-hidden" role="dialog" aria-modal="true" aria-labelledby="modal-delete-title">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div id="modal-delete-title" class="modal-title">Delete clip?</div>
+          <div id="modal-delete-subtitle" class="modal-subtitle"></div>
+        </div>
+        <button id="btn-delete-x" class="modal-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+      </div>
+      <div id="modal-delete-body" class="modal-body">
+        It goes to the Windows Recycle Bin. If you change your mind, you can restore it from there.
+      </div>
+      <div class="modal-footer">
+        <button id="btn-delete-cancel" class="btn btn-secondary" type="button">Cancel</button>
+        <button id="btn-delete-confirm" class="btn btn-danger-solid" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quit confirmation modal -->
+  <div id="modal-quit" class="modal-scrim is-hidden" role="dialog" aria-modal="true" aria-labelledby="modal-quit-title">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div id="modal-quit-title" class="modal-title">Quit clip?</div>
+          <div class="modal-subtitle">Recording stops and everything closes.</div>
+        </div>
+        <button id="btn-modal-x" class="modal-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        Recording stops and this window closes. Anything you haven't saved as a clip yet is lost.<br /><br />
+        If you only want to close the window, use the X: clip keeps recording in the background.
+      </div>
+      <div class="modal-footer">
+        <button id="btn-modal-cancel" class="btn btn-secondary" type="button">Cancel</button>
+        <button id="btn-modal-exit" class="btn btn-danger-solid" type="button">Exit</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

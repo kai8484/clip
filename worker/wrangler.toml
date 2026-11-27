@@ -1,0 +1,12 @@
+name = "clip-share"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = false
+
+[[r2_buckets]]
+binding = "CLIPS_BUCKET"
+bucket_name = "clip-shares"
+
+# routes = [
+#   { pattern = "clips.yourdomain.com", custom_domain = true }
+# ]

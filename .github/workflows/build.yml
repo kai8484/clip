@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Check
+        run: cargo clippy --workspace --locked -- -D warnings
+
+      - name: Check (devtools)
+        run: cargo clippy --workspace --locked --features devtools -- -D warnings
+
+      - name: Build release
+        run: cargo build --release --workspace --locked

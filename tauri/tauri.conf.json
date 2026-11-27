@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "clip",
+  "version": "0.3.3",
+  "identifier": "com.clip.app",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "clip",
+        "width": 880,
+        "height": 453,
+        "minWidth": 760,
+        "minHeight": 240,
+        "resizable": false,
+        "maximizable": false,
+        "transparent": false,
+        "decorations": false,
+        "theme": "Dark",
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: thumb: http://thumb.localhost; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "icon": [
+      "icons/icon.ico"
+    ]
+  },
+  "mainBinaryName": "clip"
+}
