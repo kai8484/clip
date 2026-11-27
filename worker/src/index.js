@@ -12,6 +12,27 @@ const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 
 const FTYP_MIN_BYTES = 12;
 const BIDI_CONTROL_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
+// Reserved object keys for worker-side state. Not publicly routable: every public path is a
+// single segment that must match SLUG_RE, which rejects both "/" and ".".
+const SETTINGS_KEY = "_meta/settings.json";
+const INVITES_KEY = "_meta/invites.json";
+const META_PREFIX = "_meta/";
+// Legacy objects carry no owner metadata and belong to the worker's own upload key.
+const OWNER_ID = "owner";
+const FRIEND_LABEL_MAX = 40;
+const DEFAULT_FRIEND_LABEL = "Friend";
+const TOKEN_BYTES = 24;
+const DEFAULT_TTL_SECONDS = 3 * 24 * 3600;
+const MAX_TTL_SECONDS = 365 * 86400;
+const MIN_TTL_SECONDS = 60;
+// Standard Cloudflare free-tier R2 storage allowance, used only for reporting.
+const FREE_TIER_BYTES = 10_000_000_000;
+const LIST_LIMIT = 1000;
+const MEDIA_CACHE_MAX_AGE = 3600;
+const PAGE_CACHE_MAX_AGE = 300;
+const NEVER_MEDIA_CACHE = `public, max-age=${MEDIA_CACHE_MAX_AGE}`;
+const NEVER_PAGE_CACHE = `public, max-age=${PAGE_CACHE_MAX_AGE}`;
+
 // Guarded so unit tests can run this module in runtimes without the Workers cache API.
 const edgeCache = typeof caches !== "undefined" ? caches.default : null;
 
@@ -41,6 +62,10 @@ export default {
         return json({ error: "Method not allowed" }, 405, { Allow: "PUT, POST" });
       }
       return handleUpload(request, env, url, path.slice("/upload/".length));
+    }
+
+    if (path === "/admin" || path.startsWith("/admin/")) {
+      return handleAdmin(request, env, ctx, url);
     }
 
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -76,10 +101,17 @@ export default {
     }
     return serveCached(request, ctx, () => handlePage(request, env, url, name));
   },
+
+  // Hourly Cron trigger: deletes objects whose age exceeds the current TTL setting.
+  async scheduled(event, env, ctx) {
+    await deleteExpiredObjects(env);
+  },
 };
 
 // Serves a clip response through the edge cache. Only plain GETs without a Range header are
-// cacheable; all misses and hits are (re)stored in the background.
+// cacheable; misses are (re)stored in the background, but only when the response is actually
+// cacheable. Expiring responses (a short max-age from a shortened TTL) must never be pinned at the
+// edge, otherwise they would outlive the TTL they were capped for.
 async function serveCached(request, ctx, render) {
   if (request.method !== "GET" || !edgeCache) {
     return render();
@@ -94,20 +126,25 @@ async function serveCached(request, ctx, render) {
   }
 
   const response = await render();
-  if (response.status === 200) {
+  if (response.status === 200 && isCacheableResponse(response)) {
     ctx?.waitUntil(edgeCache.put(request, response.clone()));
   }
   return response;
 }
 
+// A response is only stored at the edge when its Cache-Control opts into a positive lifetime.
+function isCacheableResponse(response) {
+  const cacheControl = response.headers.get("Cache-Control") || "";
+  if (!cacheControl) return false;
+  if (/\b(no-store|no-cache|private)\b/i.test(cacheControl)) return false;
+  const maxAge = /\bmax-age=(\d+)\b/i.exec(cacheControl);
+  return maxAge ? Number(maxAge[1]) > 0 : false;
+}
+
 async function handleUpload(request, env, url, rawName) {
-  const expectedKey = typeof env.UPLOAD_KEY === "string" ? env.UPLOAD_KEY : "";
-  if (!expectedKey) {
-    return json({ error: "Worker UPLOAD_KEY is not configured" }, 503);
-  }
-  const providedKey = extractAuthKey(request);
-  if (!providedKey || !(await timingSafeEqual(providedKey, expectedKey))) {
-    return json({ error: "Unauthorized" }, 401);
+  const { auth, response: authFailure } = await resolveAuth(request, env);
+  if (authFailure) {
+    return authFailure;
   }
 
   let decodedName;
@@ -144,6 +181,16 @@ async function handleUpload(request, env, url, rawName) {
   if (declared > maxBytes) {
     return json({ error: "Payload too large" }, 413);
   }
+  if (auth.role === "friend" && auth.friend.quotaBytes > 0) {
+    let usedBytes = 0;
+    for (const obj of await listAllObjects(env)) {
+      if (isMetaKey(obj.key)) continue;
+      if (objectOwner(obj) === auth.ownerId) usedBytes += Number(obj.size) || 0;
+    }
+    if (usedBytes + declared > auth.friend.quotaBytes) {
+      return json({ error: "Friend storage limit reached" }, 413);
+    }
+  }
   if (!request.body) {
     return json({ error: "Empty request body" }, 400);
   }
@@ -152,13 +199,16 @@ async function handleUpload(request, env, url, rawName) {
   const putOptions = {
     httpMetadata: {
       contentType,
-      cacheControl: "public, max-age=31536000, immutable",
+      // Short and revalidatable: the served lifetime is capped per request by the current TTL.
+      cacheControl: NEVER_MEDIA_CACHE,
     },
+    // Every object records its uploader: per-owner TTL, quota and scoped deletes all read this.
+    customMetadata: { owner: auth.ownerId },
     // Never silently replace an existing object.
     onlyIf: { etagDoesNotMatch: "*" },
   };
   if (isVideo) {
-    const customMetadata = {};
+    const customMetadata = putOptions.customMetadata;
     const title = sanitizeTitle(tryDecode(request.headers.get("X-Clip-Title")));
     if (title) customMetadata.title = title;
     const width = parseDimension(request.headers.get("X-Clip-Width"));
@@ -170,7 +220,6 @@ async function handleUpload(request, env, url, rawName) {
     if (request.headers.get("X-Clip-Has-Thumb") === "1") {
       customMetadata.hasThumb = "1";
     }
-    putOptions.customMetadata = customMetadata;
   }
 
   const key = isThumb ? `${slug}.png` : `${slug}.mp4`;
@@ -284,15 +333,25 @@ async function handleVideo(request, env, key) {
   const rangeHeader = request.headers.get("Range");
 
   if (request.method === "HEAD") {
-    const head = await env.CLIPS_BUCKET.head(key);
+    const [settings, invites, head] = await Promise.all([
+      readSettings(env),
+      readInvites(env),
+      env.CLIPS_BUCKET.head(key),
+    ]);
     if (!head) {
       return notFound();
     }
-    const notModified = notModifiedResponse(request, head.httpEtag);
+    const ttlSeconds = ttlForOwner(objectOwner(head), settings, invites);
+    const remaining = remainingTtlSeconds(head, ttlSeconds);
+    if (remaining <= 0) {
+      return notFound();
+    }
+    const cacheControl = mediaCacheControl(ttlSeconds, remaining);
+    const notModified = notModifiedResponse(request, head.httpEtag, cacheControl);
     if (notModified) {
       return notModified;
     }
-    const headers = videoHeaders(head, key);
+    const headers = videoHeaders(head, key, cacheControl);
     if (rangeHeader) {
       const parsed = parseRange(rangeHeader, head.size);
       if (!parsed) {
@@ -308,13 +367,14 @@ async function handleVideo(request, env, key) {
     return new Response(null, { status: 200, headers });
   }
 
-  // Single R2 roundtrip: let the bucket resolve the range instead of HEADing first.
-  let obj = null;
-  try {
-    obj = await env.CLIPS_BUCKET.get(key, rangeHeader ? { range: request.headers } : undefined);
-  } catch {
-    obj = null;
-  }
+  // Single R2 roundtrip: let the bucket resolve the range instead of HEADing first. Settings and
+  // invites are read in parallel because either can retroactively shorten the TTL.
+  const [settings, invites, fetched] = await Promise.all([
+    readSettings(env),
+    readInvites(env),
+    env.CLIPS_BUCKET.get(key, rangeHeader ? { range: request.headers } : undefined).catch(() => null),
+  ]);
+  const obj = fetched;
   if (!obj) {
     if (!rangeHeader) {
       return notFound();
@@ -323,20 +383,35 @@ async function handleVideo(request, env, key) {
     if (!head) {
       return notFound();
     }
-    const headers = videoHeaders(head, key);
+    const headTtl = ttlForOwner(objectOwner(head), settings, invites);
+    const headRemaining = remainingTtlSeconds(head, headTtl);
+    if (headRemaining <= 0) {
+      return notFound();
+    }
+    const headers = videoHeaders(head, key, mediaCacheControl(headTtl, headRemaining));
     headers.set("Content-Range", `bytes */${head.size}`);
     return new Response(null, { status: 416, headers });
   }
 
-  const notModified = notModifiedResponse(request, obj.httpEtag);
+  const ttlSeconds = ttlForOwner(objectOwner(obj), settings, invites);
+  const remaining = remainingTtlSeconds(obj, ttlSeconds);
+  if (remaining <= 0) {
+    await cancelBody(obj);
+    return notFound();
+  }
+  const cacheControl = mediaCacheControl(ttlSeconds, remaining);
+
+  const notModified = notModifiedResponse(request, obj.httpEtag, cacheControl);
   if (notModified) {
+    await cancelBody(obj);
     return notModified;
   }
 
   if (rangeHeader) {
     const parsed = parseRange(rangeHeader, obj.size);
     if (!parsed) {
-      const headers = videoHeaders(obj, key);
+      await cancelBody(obj);
+      const headers = videoHeaders(obj, key, cacheControl);
       headers.set("Content-Range", `bytes */${obj.size}`);
       return new Response(null, { status: 416, headers });
     }
@@ -344,7 +419,7 @@ async function handleVideo(request, env, key) {
       const offset = obj.range.offset;
       const length =
         typeof obj.range.length === "number" ? obj.range.length : obj.size - offset;
-      const headers = videoHeaders(obj, key);
+      const headers = videoHeaders(obj, key, cacheControl);
       headers.set("Content-Range", `bytes ${offset}-${offset + length - 1}/${obj.size}`);
       headers.set("Content-Length", String(length));
       return new Response(obj.body, { status: 206, headers });
@@ -352,66 +427,98 @@ async function handleVideo(request, env, key) {
     // The bucket ignored the range and handed back the whole object.
   }
 
-  const headers = videoHeaders(obj, key);
+  const headers = videoHeaders(obj, key, cacheControl);
   headers.set("Content-Length", String(obj.size));
   return new Response(obj.body, { status: 200, headers });
 }
 
 async function handleThumb(request, env, key) {
   if (request.method === "HEAD") {
-    const head = await env.CLIPS_BUCKET.head(key);
+    const [settings, invites, head] = await Promise.all([
+      readSettings(env),
+      readInvites(env),
+      env.CLIPS_BUCKET.head(key),
+    ]);
     if (!head) {
       return notFound();
     }
-    const notModified = notModifiedResponse(request, head.httpEtag);
+    const ttlSeconds = ttlForOwner(objectOwner(head), settings, invites);
+    const remaining = remainingTtlSeconds(head, ttlSeconds);
+    if (remaining <= 0) {
+      return notFound();
+    }
+    const cacheControl = mediaCacheControl(ttlSeconds, remaining);
+    const notModified = notModifiedResponse(request, head.httpEtag, cacheControl);
     if (notModified) {
       return notModified;
     }
-    const headers = thumbHeaders(head);
+    const headers = thumbHeaders(head, cacheControl);
     headers.set("Content-Length", String(head.size));
     return new Response(null, { status: 200, headers });
   }
 
-  const obj = await env.CLIPS_BUCKET.get(key);
+  const [settings, invites, obj] = await Promise.all([
+    readSettings(env),
+    readInvites(env),
+    env.CLIPS_BUCKET.get(key),
+  ]);
   if (!obj) {
     return notFound();
   }
-  const notModified = notModifiedResponse(request, obj.httpEtag);
+  const ttlSeconds = ttlForOwner(objectOwner(obj), settings, invites);
+  const remaining = remainingTtlSeconds(obj, ttlSeconds);
+  if (remaining <= 0) {
+    await cancelBody(obj);
+    return notFound();
+  }
+  const cacheControl = mediaCacheControl(ttlSeconds, remaining);
+  const notModified = notModifiedResponse(request, obj.httpEtag, cacheControl);
   if (notModified) {
+    await cancelBody(obj);
     return notModified;
   }
-  const headers = thumbHeaders(obj);
+  const headers = thumbHeaders(obj, cacheControl);
   headers.set("Content-Length", String(obj.size));
   return new Response(obj.body, { status: 200, headers });
 }
 
-function videoHeaders(obj, key) {
+async function cancelBody(obj) {
+  const body = obj?.body;
+  if (!body || typeof body.cancel !== "function") return;
+  try {
+    await body.cancel();
+  } catch {
+    // Already cancelled or the stream never started; nothing to release.
+  }
+}
+
+function videoHeaders(obj, key, cacheControl = NEVER_MEDIA_CACHE) {
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
   headers.set("Content-Type", "video/mp4");
   headers.set("Accept-Ranges", "bytes");
   headers.set("ETag", obj.httpEtag);
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", cacheControl);
   headers.set("Content-Disposition", `inline; filename="${key}"`);
   return withSecurityHeaders(headers);
 }
 
-function thumbHeaders(obj) {
+function thumbHeaders(obj, cacheControl = NEVER_MEDIA_CACHE) {
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
   headers.set("Content-Type", "image/png");
   headers.set("ETag", obj.httpEtag);
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", cacheControl);
   return withSecurityHeaders(headers);
 }
 
-function notModifiedResponse(request, etag) {
+function notModifiedResponse(request, etag, cacheControl = NEVER_MEDIA_CACHE) {
   if (!etagMatches(request.headers.get("If-None-Match"), etag)) {
     return null;
   }
   const headers = new Headers();
   headers.set("ETag", etag);
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", cacheControl);
   return new Response(null, { status: 304, headers: withSecurityHeaders(headers) });
 }
 
@@ -424,7 +531,11 @@ function etagMatches(ifNoneMatch, etag) {
 }
 
 async function handlePage(request, env, url, slug) {
-  const head = await env.CLIPS_BUCKET.head(`${slug}.mp4`);
+  const [settings, invites, head] = await Promise.all([
+    readSettings(env),
+    readInvites(env),
+    env.CLIPS_BUCKET.head(`${slug}.mp4`),
+  ]);
   if (!head) {
     return new Response("Clip not found", {
       status: 404,
@@ -433,10 +544,15 @@ async function handlePage(request, env, url, slug) {
       ),
     });
   }
+  const ttlSeconds = ttlForOwner(objectOwner(head), settings, invites);
+  const remaining = remainingTtlSeconds(head, ttlSeconds);
+  if (remaining <= 0) {
+    return notFound();
+  }
 
   const headers = new Headers({
     "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "public, max-age=300",
+    "Cache-Control": pageCacheControl(ttlSeconds, remaining),
   });
   withSecurityHeaders(headers);
   if (request.method === "HEAD") {
@@ -523,6 +639,559 @@ async function timingSafeEqual(a, b) {
     diff |= x[i] ^ y[i];
   }
   return diff === 0;
+}
+
+// Resolves the caller from either the worker's own upload key or a friend invite token. Returns
+// `{ auth }` on success or `{ response }` with the error to send. Every invite hash is compared on
+// every attempt (no early exit) so a miss costs the same whatever the matching prefix is.
+async function resolveAuth(request, env) {
+  const expectedKey = typeof env.UPLOAD_KEY === "string" ? env.UPLOAD_KEY : "";
+  if (!expectedKey) {
+    return { response: json({ error: "Worker UPLOAD_KEY is not configured" }, 503) };
+  }
+  const providedKey = extractAuthKey(request);
+  if (!providedKey) {
+    return { response: json({ error: "Unauthorized" }, 401) };
+  }
+  if (await timingSafeEqual(providedKey, expectedKey)) {
+    return { auth: { role: "owner", ownerId: OWNER_ID, friend: null } };
+  }
+
+  const { friends } = await readInvites(env);
+  if (friends.length > 0) {
+    const providedHash = await sha256Hex(providedKey);
+    let matched = null;
+    for (const friend of friends) {
+      const same = await timingSafeEqual(providedHash, friend.tokenHash);
+      if (same) matched = matched || friend;
+    }
+    if (matched) {
+      return { auth: { role: "friend", ownerId: matched.id, friend: matched } };
+    }
+  }
+  return { response: json({ error: "Unauthorized" }, 401) };
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", TEXT_ENCODER.encode(String(value)));
+  let hex = "";
+  for (const byte of new Uint8Array(digest)) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+// --- Ownership ---------------------------------------------------------------------------
+
+function isMetaKey(key) {
+  return typeof key === "string" && key.startsWith(META_PREFIX);
+}
+
+// Objects stored before multi-user support have no owner tag and belong to the upload key.
+function objectOwner(obj) {
+  const owner = obj?.customMetadata?.owner;
+  return typeof owner === "string" && owner ? owner : OWNER_ID;
+}
+
+// --- TTL settings -------------------------------------------------------------------------
+
+// Accepts only the documented policy: 0 (never delete) or 60s..365d.
+function normalizeTtlSeconds(value) {
+  if (!Number.isInteger(value)) return null;
+  if (value === 0) return 0;
+  if (value >= MIN_TTL_SECONDS && value <= MAX_TTL_SECONDS) return value;
+  return null;
+}
+
+// Reads the worker settings object; a missing, unreadable, or corrupt object means "defaults".
+async function readSettings(env) {
+  const fallback = { ttlSeconds: DEFAULT_TTL_SECONDS };
+  let obj = null;
+  try {
+    obj = await env.CLIPS_BUCKET.get(SETTINGS_KEY);
+  } catch {
+    return fallback;
+  }
+  if (!obj) return fallback;
+  try {
+    const parsed = JSON.parse(await obj.text());
+    const ttlSeconds = normalizeTtlSeconds(parsed?.ttlSeconds);
+    if (ttlSeconds === null) return fallback;
+    return { ...parsed, ttlSeconds };
+  } catch {
+    return fallback;
+  }
+}
+
+// --- Friend invites -----------------------------------------------------------------------
+
+// Reads the invite list; a missing, unreadable, or corrupt object means "no friends". Every entry
+// is re-normalized because the object is plain JSON written by an earlier worker version.
+async function readInvites(env) {
+  const fallback = { friends: [] };
+  let obj = null;
+  try {
+    obj = await env.CLIPS_BUCKET.get(INVITES_KEY);
+  } catch {
+    return fallback;
+  }
+  if (!obj) return fallback;
+  try {
+    const parsed = JSON.parse(await obj.text());
+    const raw = Array.isArray(parsed?.friends) ? parsed.friends : [];
+    const friends = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      if (typeof entry.id !== "string" || !entry.id) continue;
+      if (typeof entry.tokenHash !== "string" || !entry.tokenHash) continue;
+      const ttlSeconds = normalizeTtlSeconds(entry.ttlSeconds);
+      friends.push({
+        id: entry.id,
+        label: typeof entry.label === "string" && entry.label ? entry.label : DEFAULT_FRIEND_LABEL,
+        tokenHash: entry.tokenHash,
+        ttlSeconds: ttlSeconds === null ? DEFAULT_TTL_SECONDS : ttlSeconds,
+        quotaBytes: normalizeQuotaBytes(entry.quotaBytes),
+        createdAt: Number.isFinite(Number(entry.createdAt)) ? Number(entry.createdAt) : 0,
+      });
+    }
+    return { friends };
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeInvites(env, invites) {
+  await env.CLIPS_BUCKET.put(
+    INVITES_KEY,
+    JSON.stringify({ friends: invites.friends || [] }),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+// Effective TTL for an object's owner. A revoked friend id falls back to the owner policy so its
+// clips keep a finite lifetime instead of being orphaned forever.
+function ttlForOwner(ownerId, settings, invites) {
+  const fallback = settings?.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+  if (!ownerId || ownerId === OWNER_ID) return fallback;
+  const friend = invites?.friends?.find((entry) => entry.id === ownerId);
+  return friend ? friend.ttlSeconds : fallback;
+}
+
+// Seconds left before the object expires. `Infinity` means "never". Retroactive by design: it
+// compares the object's upload time against the *current* setting, so shortening the TTL expires
+// existing clips immediately without rewriting them.
+function remainingTtlSeconds(obj, ttlSeconds, nowMs = Date.now()) {
+  if (!ttlSeconds || ttlSeconds <= 0) return Infinity;
+  const uploadedMs =
+    obj?.uploaded instanceof Date ? obj.uploaded.getTime() : Number(obj?.uploaded);
+  if (!Number.isFinite(uploadedMs)) return ttlSeconds;
+  return ttlSeconds - (nowMs - uploadedMs) / 1000;
+}
+
+function mediaCacheControl(ttlSeconds, remainingSeconds) {
+  if (!ttlSeconds || ttlSeconds <= 0 || !Number.isFinite(remainingSeconds)) {
+    return NEVER_MEDIA_CACHE;
+  }
+  return `public, max-age=${Math.min(MEDIA_CACHE_MAX_AGE, Math.max(1, Math.floor(remainingSeconds)))}`;
+}
+
+function pageCacheControl(ttlSeconds, remainingSeconds) {
+  if (!ttlSeconds || ttlSeconds <= 0 || !Number.isFinite(remainingSeconds)) {
+    return NEVER_PAGE_CACHE;
+  }
+  return `public, max-age=${Math.min(PAGE_CACHE_MAX_AGE, Math.max(1, Math.floor(remainingSeconds)))}`;
+}
+
+// --- Bucket listing -----------------------------------------------------------------------
+
+async function listAllObjects(env) {
+  const objects = [];
+  let cursor;
+  for (;;) {
+    const page = await env.CLIPS_BUCKET.list({
+      limit: LIST_LIMIT,
+      cursor,
+      // Ownership lives in customMetadata; without this the listing omits it and every object
+      // looks like it belongs to the upload key.
+      include: ["customMetadata"],
+    });
+    if (Array.isArray(page?.objects)) {
+      objects.push(...page.objects);
+    }
+    if (!page?.truncated || !page.cursor) {
+      return objects;
+    }
+    cursor = page.cursor;
+  }
+}
+
+// Deletes keys in batches of 1,000 (the R2 per-call maximum for multi-delete).
+async function deleteKeys(env, keys) {
+  let deleted = 0;
+  for (let i = 0; i < keys.length; i += LIST_LIMIT) {
+    const batch = keys.slice(i, i + LIST_LIMIT);
+    await env.CLIPS_BUCKET.delete(batch);
+    deleted += batch.length;
+  }
+  return deleted;
+}
+
+// --- Admin --------------------------------------------------------------------------------
+
+async function handleAdmin(request, env, ctx, url) {
+  const { auth, response: authFailure } = await resolveAuth(request, env);
+  if (authFailure) {
+    return authFailure;
+  }
+
+  const path = url.pathname;
+  if (path === "/admin/stats") {
+    if (request.method !== "GET") {
+      return methodNotAllowed("GET");
+    }
+    return adminStats(env, auth);
+  }
+  if (path === "/admin/settings") {
+    if (request.method !== "PUT" && request.method !== "POST") {
+      return methodNotAllowed("PUT, POST");
+    }
+    return adminUpdateSettings(request, env, auth);
+  }
+  if (path === "/admin/clips") {
+    if (request.method !== "DELETE") {
+      return methodNotAllowed("DELETE");
+    }
+    return adminDeleteClips(env, ctx, url, auth);
+  }
+  if (path === "/admin/invites") {
+    if (request.method !== "POST") {
+      return methodNotAllowed("POST");
+    }
+    return adminCreateInvite(request, env, auth);
+  }
+  if (path.startsWith("/admin/invites/")) {
+    if (request.method !== "DELETE") {
+      return methodNotAllowed("DELETE");
+    }
+    return adminRevokeInvite(env, ctx, url, auth, path.slice("/admin/invites/".length));
+  }
+  return json({ error: "Not found" }, 404);
+}
+
+// Every caller sees the bucket totals plus their own usage; only the owner gets the friend list,
+// and it never carries token hashes.
+async function adminStats(env, auth) {
+  const [settings, invites, objects] = await Promise.all([
+    readSettings(env),
+    readInvites(env),
+    listAllObjects(env),
+  ]);
+  const now = Date.now();
+  const ownTtlSeconds =
+    auth.role === "friend" ? auth.friend.ttlSeconds : settings.ttlSeconds;
+  const perOwner = new Map();
+  const bucket = { usedBytes: 0, clipCount: 0, objectCount: 0 };
+  const own = { usedBytes: 0, clipCount: 0, objectCount: 0, expiredCount: 0 };
+
+  for (const obj of objects) {
+    if (isMetaKey(obj.key)) continue;
+    const size = Number(obj.size) || 0;
+    const isClip = obj.key.endsWith(".mp4");
+    const ownerId = objectOwner(obj);
+
+    bucket.usedBytes += size;
+    bucket.objectCount += 1;
+    if (isClip) bucket.clipCount += 1;
+
+    let entry = perOwner.get(ownerId);
+    if (!entry) {
+      entry = { usedBytes: 0, clipCount: 0, objectCount: 0 };
+      perOwner.set(ownerId, entry);
+    }
+    entry.usedBytes += size;
+    entry.objectCount += 1;
+    if (isClip) entry.clipCount += 1;
+
+    if (ownerId === auth.ownerId) {
+      own.usedBytes += size;
+      own.objectCount += 1;
+      if (isClip) own.clipCount += 1;
+      if (remainingTtlSeconds(obj, ownTtlSeconds, now) <= 0) own.expiredCount += 1;
+    }
+  }
+
+  const friends =
+    auth.role === "owner"
+      ? invites.friends.map((friend) => {
+          const usage = perOwner.get(friend.id) || {
+            usedBytes: 0,
+            clipCount: 0,
+            objectCount: 0,
+          };
+          return {
+            id: friend.id,
+            label: friend.label,
+            ttlSeconds: friend.ttlSeconds,
+            quotaBytes: friend.quotaBytes,
+            createdAt: friend.createdAt,
+            usedBytes: usage.usedBytes,
+            clipCount: usage.clipCount,
+            objectCount: usage.objectCount,
+          };
+        })
+      : [];
+
+  return json({
+    ok: true,
+    role: auth.role,
+    label: auth.role === "friend" ? auth.friend.label : null,
+    usedBytes: own.usedBytes,
+    clipCount: own.clipCount,
+    objectCount: own.objectCount,
+    expiredCount: own.expiredCount,
+    bucketUsedBytes: bucket.usedBytes,
+    bucketClipCount: bucket.clipCount,
+    bucketObjectCount: bucket.objectCount,
+    freeTierBytes: FREE_TIER_BYTES,
+    quotaBytes: auth.role === "friend" ? auth.friend.quotaBytes : 0,
+    ttlSeconds: ownTtlSeconds,
+    friends,
+  });
+}
+
+// The owner's TTL is a bucket-wide policy; a friend can only shorten (or reset) their own copy.
+async function adminUpdateSettings(request, env, auth) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Body must be JSON" }, 400);
+  }
+
+  const ttlSeconds = normalizeTtlSeconds(body?.ttlSeconds);
+  if (ttlSeconds === null) {
+    return json(
+      {
+        error: `ttlSeconds must be 0 (never) or an integer between ${MIN_TTL_SECONDS} and ${MAX_TTL_SECONDS}`,
+      },
+      400,
+    );
+  }
+
+  if (auth.role === "friend") {
+    const invites = await readInvites(env);
+    const friend = invites.friends.find((entry) => entry.id === auth.ownerId);
+    if (!friend) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+    friend.ttlSeconds = ttlSeconds;
+    await writeInvites(env, invites);
+    return json({ ok: true, ttlSeconds });
+  }
+
+  await env.CLIPS_BUCKET.put(
+    SETTINGS_KEY,
+    JSON.stringify({ ttlSeconds, updatedAt: Date.now() }),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+  return json({ ok: true, ttlSeconds });
+}
+
+// `scope=mine` (default) touches only the caller's objects; `scope=all` is owner-only.
+async function adminDeleteClips(env, ctx, url, auth) {
+  const scope = url.searchParams.get("scope") || "mine";
+  if (scope !== "mine" && scope !== "all") {
+    return json({ error: 'scope must be "mine" or "all"' }, 400);
+  }
+  if (scope === "all" && auth.role !== "owner") {
+    return json({ error: "Only the owner can delete everyone's clips" }, 403);
+  }
+
+  const keys = (await listAllObjects(env))
+    .filter((obj) => !isMetaKey(obj.key))
+    .filter((obj) => scope === "all" || objectOwner(obj) === auth.ownerId)
+    .map((obj) => obj.key);
+
+  const deletedClips = keys.filter((key) => key.endsWith(".mp4")).length;
+  const deletedObjects = await deleteKeys(env, keys);
+  await purgeEdgeCache(ctx, url, keys);
+
+  return json({ ok: true, scope, deletedObjects, deletedClips });
+}
+
+async function adminCreateInvite(request, env, auth) {
+  const forbidden = ownerOnly(auth);
+  if (forbidden) return forbidden;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Body must be JSON" }, 400);
+  }
+
+  let label = DEFAULT_FRIEND_LABEL;
+  if (body?.label !== undefined && body?.label !== null) {
+    if (typeof body.label !== "string") {
+      return json({ error: "label must be a string" }, 400);
+    }
+    label = body.label.trim() || DEFAULT_FRIEND_LABEL;
+    if (label.length > FRIEND_LABEL_MAX) {
+      return json(
+        { error: `label must be at most ${FRIEND_LABEL_MAX} characters` },
+        400,
+      );
+    }
+  }
+
+  const settings = await readSettings(env);
+  let ttlSeconds = settings.ttlSeconds;
+  if (body?.ttlSeconds !== undefined) {
+    ttlSeconds = normalizeTtlSeconds(body.ttlSeconds);
+    if (ttlSeconds === null) {
+      return json(
+        {
+          error: `ttlSeconds must be 0 (never) or an integer between ${MIN_TTL_SECONDS} and ${MAX_TTL_SECONDS}`,
+        },
+        400,
+      );
+    }
+  }
+
+  let quotaBytes = 0;
+  if (body?.quotaBytes !== undefined && body?.quotaBytes !== null) {
+    quotaBytes = parseQuotaBytes(body.quotaBytes);
+    if (quotaBytes === null) {
+      return json({ error: "quotaBytes must be an integer >= 0" }, 400);
+    }
+  }
+
+  const invites = await readInvites(env);
+  const token = base64UrlEncode(crypto.getRandomValues(new Uint8Array(TOKEN_BYTES)));
+  const entry = {
+    id: `f_${randomHex(4)}`,
+    label,
+    tokenHash: await sha256Hex(token),
+    ttlSeconds,
+    quotaBytes,
+    createdAt: Date.now(),
+  };
+  invites.friends.push(entry);
+  await writeInvites(env, invites);
+
+  // The plaintext token is returned exactly once; only its hash is persisted.
+  return json({
+    ok: true,
+    id: entry.id,
+    label: entry.label,
+    token,
+    ttlSeconds: entry.ttlSeconds,
+    quotaBytes: entry.quotaBytes,
+    createdAt: entry.createdAt,
+  });
+}
+
+async function adminRevokeInvite(env, ctx, url, auth, id) {
+  const forbidden = ownerOnly(auth);
+  if (forbidden) return forbidden;
+
+  const invites = await readInvites(env);
+  const index = invites.friends.findIndex((friend) => friend.id === id);
+  if (index === -1) {
+    return json({ error: "Invite not found" }, 404);
+  }
+  invites.friends.splice(index, 1);
+  await writeInvites(env, invites);
+
+  let deletedObjects = 0;
+  let deletedClips = 0;
+  if (url.searchParams.get("deleteClips") === "1") {
+    const keys = (await listAllObjects(env))
+      .filter((obj) => !isMetaKey(obj.key) && objectOwner(obj) === id)
+      .map((obj) => obj.key);
+    deletedClips = keys.filter((key) => key.endsWith(".mp4")).length;
+    deletedObjects = await deleteKeys(env, keys);
+    await purgeEdgeCache(ctx, url, keys);
+  }
+
+  return json({ ok: true, id, deletedObjects, deletedClips });
+}
+
+function ownerOnly(auth) {
+  if (auth.role === "owner") return null;
+  return json({ error: "Only the owner can manage invites" }, 403);
+}
+
+function parseQuotaBytes(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeQuotaBytes(value) {
+  const parsed = parseQuotaBytes(Number(value));
+  return parsed === null ? 0 : parsed;
+}
+
+function randomHex(byteLength) {
+  let hex = "";
+  for (const byte of crypto.getRandomValues(new Uint8Array(byteLength))) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Best-effort edge purge: a stale cache entry would otherwise outlive the deleted objects.
+async function purgeEdgeCache(ctx, url, keys) {
+  if (!edgeCache || keys.length === 0) return;
+  const slugs = new Set(
+    keys.map((key) => (key.endsWith(".mp4") || key.endsWith(".png") ? key.slice(0, -4) : key)),
+  );
+  const purges = [];
+  for (const slug of slugs) {
+    for (const path of [`/${slug}`, `/${slug}.mp4`, `/${slug}.png`]) {
+      purges.push(edgeCache.delete(`${url.origin}${path}`).catch(() => false));
+    }
+  }
+  const all = Promise.all(purges).catch(() => {});
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(all);
+  } else {
+    await all;
+  }
+}
+
+// --- Cron ---------------------------------------------------------------------------------
+
+async function deleteExpiredObjects(env) {
+  const [settings, invites] = await Promise.all([readSettings(env), readInvites(env)]);
+  // Only skip the hourly scan when no owner can ever expire: nobody is on a finite TTL.
+  if (
+    settings.ttlSeconds <= 0 &&
+    invites.friends.every((friend) => friend.ttlSeconds <= 0)
+  ) {
+    return;
+  }
+
+  const now = Date.now();
+  const expired = [];
+  for (const obj of await listAllObjects(env)) {
+    if (isMetaKey(obj.key)) continue;
+    const ttlSeconds = ttlForOwner(objectOwner(obj), settings, invites);
+    if (remainingTtlSeconds(obj, ttlSeconds, now) <= 0) {
+      expired.push(obj.key);
+    }
+  }
+
+  await deleteKeys(env, expired);
+}
+
+function methodNotAllowed(allow) {
+  return json({ error: "Method not allowed" }, 405, { Allow: allow });
 }
 
 function parseRange(header, size) {

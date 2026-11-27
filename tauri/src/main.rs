@@ -44,7 +44,10 @@ use clip::log::{app_dir, log};
 use clip::mf::Mf;
 use clip::record::audio;
 use clip::record::recorder::{Event, Notify, Recorder};
-use clip::share::{self, ShareMeta, ShareRecord, ShareResult, ShareStore};
+use clip::share::{
+    self, PurgeR2Result, R2Friend, R2Stats, RevokeInviteResult, ShareMeta, ShareRecord, ShareResult,
+    ShareStore,
+};
 
 use clip::ui_kit::sound;
 use clip::ui_kit::theme::fmt_secs;
@@ -950,6 +953,20 @@ fn scan_clips(dir: &Path, share: &ShareCtx) -> Vec<ClipEntry> {
     clips
 }
 
+/// RAM held by the capture ring buffer, as shown to the UI.
+///
+/// `typical_ram_mb` describes an active buffer, so it must not be reported when no buffer is
+/// alive: the capture thread stops on request (`!running`), pauses via `apply_config` which drops
+/// the recorder (`!cfg.enabled`), waits for a game in `GamesOnly` mode, or exits its session after a
+/// capture error and retries in 3 s (`has_error`).
+fn estimated_ram_mb(cfg: &Config, running: bool, idle_waiting: bool, has_error: bool) -> u32 {
+    if !running || !cfg.enabled || idle_waiting || has_error {
+        0
+    } else {
+        cfg.typical_ram_mb()
+    }
+}
+
 fn build_state_snapshot(st: &CoreState) -> RecorderState {
     let idle_waiting = st.running
         && st.cfg.enabled
@@ -960,7 +977,7 @@ fn build_state_snapshot(st: &CoreState) -> RecorderState {
         enabled: st.cfg.enabled,
         idle_waiting,
         seconds: st.cfg.seconds,
-        ram_mb: if idle_waiting { 0 } else { st.cfg.typical_ram_mb() },
+        ram_mb: estimated_ram_mb(&st.cfg, st.running, idle_waiting, st.error.is_some()),
         clips_count: st.clips_count,
         hotkey_label: hotkey_name(st.cfg.hotkey_vk, st.cfg.hotkey_mods),
         game: st.game.clone(),
@@ -1440,6 +1457,143 @@ async fn set_share_key(
     Ok(FrontendConfig::from_config(&cfg))
 }
 
+/// Both halves of the share target, or the error every R2 admin call should surface.
+fn require_share_target(shared: &AppShared) -> Result<(String, String), String> {
+    let st = shared.0.lock().unwrap();
+    if !is_share_configured(&st.cfg) {
+        return Err("Set Share URL and Upload key first.".into());
+    }
+    Ok((st.cfg.share_url.clone(), st.cfg.share_key.clone()))
+}
+
+#[tauri::command]
+async fn get_r2_stats(state: State<'_, AppShared>) -> Result<R2Stats, String> {
+    let (share_url, share_key) = require_share_target(state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || share::fetch_r2_stats(&share_url, &share_key))
+        .await
+        .map_err(|e| format!("R2 stats task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn set_r2_ttl(state: State<'_, AppShared>, ttl_seconds: u64) -> Result<u64, String> {
+    let (share_url, share_key) = require_share_target(state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        share::set_r2_ttl(&share_url, &share_key, ttl_seconds)
+    })
+    .await
+    .map_err(|e| format!("R2 settings task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn delete_all_r2_clips(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+    scope: Option<String>,
+) -> Result<PurgeR2Result, String> {
+    // Default to the caller's own clips: "all" is an Owner-only extra.
+    let scope = scope.unwrap_or_else(|| "mine".to_string());
+    let (share_url, share_key, base_url, shares) = {
+        let st = state.0.lock().unwrap();
+        if !is_share_configured(&st.cfg) {
+            return Err("Set Share URL and Upload key first.".into());
+        }
+        (
+            st.cfg.share_url.clone(),
+            st.cfg.share_key.clone(),
+            normalized_share_base(&st.cfg.share_url),
+            st.shares.clone(),
+        )
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let result = share::delete_all_r2_clips(&share_url, &share_key, &scope)?;
+        // Every clip this PC uploaded belongs to the caller, so both scopes invalidate the cached
+        // links here. Local .mp4 files stay either way.
+        shares.remove_for_base(&base_url);
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|e| format!("R2 delete task failed: {e}"))??;
+    // Card share state is cached, so the gallery has to re-list to fall back to "Share link".
+    let _ = app.emit("clips-changed", ());
+    Ok(result)
+}
+
+/// Imports a `clip-cf:` friend invite: saves its base URL and key, without echoing the key back.
+#[tauri::command]
+async fn import_cf_invite(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+    invite: String,
+) -> Result<FrontendConfig, String> {
+    let (share_url, share_key) = share::decode_invite_code(&invite)?;
+    let mut cfg = { state.0.lock().unwrap().cfg.clone() };
+    cfg.share_url = share_url;
+    cfg.share_key = share_key;
+    cfg.sanitize();
+    let (cfg, saved) = tauri::async_runtime::spawn_blocking(move || {
+        let res = config::save(&cfg);
+        (cfg, res)
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {e}"))?;
+    saved.map_err(|e| format!("Failed to save config: {e}"))?;
+    apply_config(&state, &app, cfg.clone(), None);
+    Ok(FrontendConfig::from_config(&cfg))
+}
+
+/// Mints a friend invite; the raw token stays here and only the invite code reaches the clipboard.
+#[tauri::command]
+async fn create_r2_invite(
+    state: State<'_, AppShared>,
+    label: String,
+    quota_bytes: u64,
+) -> Result<R2Friend, String> {
+    let (share_url, share_key) = require_share_target(state.inner())?;
+    let created = tauri::async_runtime::spawn_blocking(move || {
+        share::create_r2_invite(&share_url, &share_key, &label, quota_bytes)
+    })
+    .await
+    .map_err(|e| format!("R2 invite task failed: {e}"))??;
+    share::copy_to_clipboard(&created.invite_code)?;
+    Ok(created.friend)
+}
+
+/// Revokes a friend invite, optionally deleting the clips that friend uploaded.
+#[tauri::command]
+async fn revoke_r2_invite(
+    state: State<'_, AppShared>,
+    id: String,
+    delete_clips: bool,
+) -> Result<RevokeInviteResult, String> {
+    let (share_url, share_key) = require_share_target(state.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        share::revoke_r2_invite(&share_url, &share_key, &id, delete_clips)
+    })
+    .await
+    .map_err(|e| format!("R2 revoke task failed: {e}"))?
+}
+
+/// Forgets the saved Worker credentials, leaving the bucket and cached links untouched.
+#[tauri::command]
+async fn disconnect_r2(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+) -> Result<FrontendConfig, String> {
+    let mut cfg = { state.0.lock().unwrap().cfg.clone() };
+    cfg.share_url.clear();
+    cfg.share_key.clear();
+    cfg.sanitize();
+    let (cfg, saved) = tauri::async_runtime::spawn_blocking(move || {
+        let res = config::save(&cfg);
+        (cfg, res)
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {e}"))?;
+    saved.map_err(|e| format!("Failed to save config: {e}"))?;
+    apply_config(&state, &app, cfg.clone(), None);
+    Ok(FrontendConfig::from_config(&cfg))
+}
+
 #[tauri::command]
 async fn recorder_state(state: State<'_, AppShared>) -> Result<RecorderState, String> {
     let shared = state.inner().clone();
@@ -1745,7 +1899,7 @@ async fn share_clip(
         (st.cfg.output_dir.clone(), ShareCtx::from_state(&app, &st))
     };
     if !share.configured {
-        return Err("Set Share URL and Upload key in Settings first.".into());
+        return Err("Set Share URL and Upload key in the Cloudflare tab first.".into());
     }
     let clip_path = resolve_clip_in_dir(&output_dir, &path)?;
     let (res, already_uploaded, copied) = tauri::async_runtime::spawn_blocking(move || {
@@ -2352,6 +2506,13 @@ fn main() {
             get_config,
             set_config,
             set_share_key,
+            get_r2_stats,
+            set_r2_ttl,
+            delete_all_r2_clips,
+            disconnect_r2,
+            import_cf_invite,
+            create_r2_invite,
+            revoke_r2_invite,
             recorder_state,
             toggle_recording,
             start_recorder,
@@ -2392,4 +2553,47 @@ fn main() {
         }
     }
     drop(old_rec);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recording_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.capture_mode = CaptureMode::Screen;
+        cfg
+    }
+
+    #[test]
+    fn active_recording_reports_typical_ram() {
+        let cfg = recording_cfg();
+        assert_eq!(estimated_ram_mb(&cfg, true, false, false), cfg.typical_ram_mb());
+        assert!(cfg.typical_ram_mb() > 0);
+    }
+
+    #[test]
+    fn games_only_idle_waiting_holds_no_buffer() {
+        let cfg = recording_cfg();
+        assert_eq!(estimated_ram_mb(&cfg, true, true, false), 0);
+    }
+
+    #[test]
+    fn paused_holds_no_buffer() {
+        let mut cfg = recording_cfg();
+        cfg.enabled = false;
+        assert_eq!(estimated_ram_mb(&cfg, true, false, false), 0);
+    }
+
+    #[test]
+    fn stopped_holds_no_buffer() {
+        let cfg = recording_cfg();
+        assert_eq!(estimated_ram_mb(&cfg, false, false, false), 0);
+    }
+
+    #[test]
+    fn capture_error_holds_no_buffer() {
+        let cfg = recording_cfg();
+        assert_eq!(estimated_ram_mb(&cfg, true, false, true), 0);
+    }
 }

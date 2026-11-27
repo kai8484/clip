@@ -10,3 +10,6 @@ bucket_name = "clip-shares"
 # routes = [
 #   { pattern = "clips.yourdomain.com", custom_domain = true }
 # ]
+
+[triggers]
+crons = ["0 * * * *"]

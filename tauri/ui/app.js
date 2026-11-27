@@ -36,6 +36,20 @@
   let sharingPaths = new Set();
   // Last share settings the clip cards were rendered against, so toggling R2 on/off can refresh them.
   let renderedShareConfig = null;
+  // Share settings the R2 usage was loaded for, so a URL/key change reloads it instead of showing stale numbers.
+  let renderedStatsKey = null;
+  let r2Stats = null;
+  let r2StatsError = null;
+  let r2StatsLoading = false;
+  let r2TtlSaving = false;
+  let r2Purging = false;
+  let r2PurgeScope = 'mine';
+  let r2InviteCreating = false;
+  let r2RevokeTarget = null;
+  let r2Revoking = false;
+  const R2_FREE_TIER_FALLBACK = 1e10;
+  const R2_TTL_CAPTION_OWNER = 'Applies only to your clips in R2: expired clips stop loading right away, and an hourly sweep deletes them.';
+  const R2_TTL_CAPTION_FRIEND = "Applies only to your clips in R2 \u2014 does not change the owner's or other friends' settings.";
 
   const $ = (id) => document.getElementById(id);
 
@@ -149,7 +163,7 @@
 
   async function switchTab(name) {
     activeTab = name;
-    const tabs = ['clips', 'settings'];
+    const tabs = ['clips', 'settings', 'cloudflare'];
     for (const t of tabs) {
       const isCurrent = t === name;
       $(`tab-${t}`).classList.toggle('is-active', isCurrent);
@@ -177,6 +191,10 @@
       syncWindowHeight(true);
       refreshClips({ silent: true });
       return;
+    }
+    if (name === 'cloudflare') {
+      renderR2();
+      refreshR2Stats({ silent: true });
     }
     syncWindowHeight(true);
   }
@@ -1250,9 +1268,465 @@
     }
     renderedShareConfig = shareKey;
 
+    // R2 admin calls need both halves, so usage is (re)loaded whenever the credentials behind it change.
+    const shareReady = isShareConfigured();
+    if (shareReady && renderedStatsKey !== shareKey) {
+      refreshR2Stats({ silent: true });
+    } else if (!shareReady) {
+      r2Stats = null;
+      r2StatsError = null;
+    }
+    renderedStatsKey = shareReady ? shareKey : null;
+    renderR2();
+
     renderEstimatedSize();
 
     syncWindowHeight(true);
+  }
+
+  // ---- Cloudflare R2 tab ---------------------------------------------------------------------
+
+  // Either half of the credentials is enough to have something to disconnect.
+  function r2ConnectedAny() {
+    return Boolean(cfg && (cfg.share_url?.trim() || cfg.has_share_key));
+  }
+
+  // Whole gigabytes (the 10 GB free tier) read cleaner without decimals.
+  function fmtStorageSize(bytes) {
+    const n = Math.max(0, Number(bytes || 0));
+    if (n >= 1e9) {
+      const gb = n / 1e9;
+      return `${Number.isInteger(gb) ? gb : gb.toFixed(2)} GB`;
+    }
+    return fmtBytes(n);
+  }
+
+  function fmtTtl(seconds) {
+    const s = Math.max(0, Number(seconds || 0));
+    if (s === 0) return 'Never';
+    if (s % 86400 === 0) return `${s / 86400} d`;
+    if (s % 3600 === 0) return `${s / 3600} h`;
+    return `${Math.max(1, Math.round(s / 60))} min`;
+  }
+
+  function plural(n, one, many) {
+    return `${fmtCount(n)} ${Number(n) === 1 ? one : many}`;
+  }
+
+  // Everything the storage card shows, resolved into one place so the states cannot disagree.
+  function r2StorageView() {
+    if (!isShareConfigured()) {
+      return {
+        summary: 'Not connected',
+        detail: 'Connect Cloudflare R2 to see storage usage.',
+        tone: 'muted',
+        pct: 0,
+      };
+    }
+    if (r2StatsError) {
+      return { summary: r2StatsError, detail: '', tone: 'error', pct: 0 };
+    }
+    if (r2StatsLoading || !r2Stats) {
+      return {
+        summary: 'Loading\u2026',
+        detail: 'Reading bucket usage\u2026',
+        tone: 'muted',
+        pct: 0,
+      };
+    }
+    const free = Number(r2Stats.free_tier_bytes) > 0 ? Number(r2Stats.free_tier_bytes) : R2_FREE_TIER_FALLBACK;
+    const used = Math.max(0, Number(r2Stats.used_bytes || 0));
+    const bucketUsed = Math.max(0, Number(r2Stats.bucket_used_bytes || 0));
+
+    if (r2Stats.role === 'friend') {
+      const quota = Math.max(0, Number(r2Stats.quota_bytes || 0));
+      const detail = `${plural(r2Stats.clip_count, 'clip', 'clips')} \u00b7 ${plural(r2Stats.object_count, 'object', 'objects')} (yours)`;
+      if (quota > 0) {
+        return {
+          summary: `${fmtBytes(used)} of ${fmtStorageSize(quota)} limit used \u00b7 ${fmtStorageSize(Math.max(0, quota - used))} left`,
+          detail,
+          tone: 'live',
+          pct: Math.min(100, (used / quota) * 100),
+        };
+      }
+      return {
+        summary: `${fmtBytes(used)} used by you \u00b7 ${fmtStorageSize(Math.max(0, free - bucketUsed))} of ${fmtStorageSize(free)} bucket free tier left`,
+        detail,
+        tone: 'live',
+        pct: free > 0 ? Math.min(100, (bucketUsed / free) * 100) : 0,
+      };
+    }
+
+    const detail = `You: ${plural(r2Stats.clip_count, 'clip', 'clips')} (${fmtBytes(used)}) \u00b7 Bucket total: ${plural(r2Stats.bucket_clip_count, 'clip', 'clips')} (${fmtBytes(bucketUsed)})`;
+    return {
+      summary: bucketUsed > free
+        ? `${fmtBytes(bucketUsed)} used \u00b7 over ${fmtStorageSize(free)} free tier`
+        : `${fmtBytes(bucketUsed)} used \u00b7 ${fmtStorageSize(Math.max(0, free - bucketUsed))} of ${fmtStorageSize(free)} free tier left`,
+      detail,
+      tone: 'live',
+      pct: free > 0 ? Math.min(100, (bucketUsed / free) * 100) : 0,
+    };
+  }
+
+  function r2ConnectionLabel() {
+    if (!isShareConfigured()) {
+      return r2ConnectedAny() ? 'Not connected \u2014 set both Share URL and Upload key' : 'Not connected';
+    }
+    if (r2Stats?.role === 'friend') return `Connected as Friend (${r2Stats.label || 'invite'})`;
+    if (r2Stats?.role === 'owner') return 'Connected as Owner';
+    return 'Connected';
+  }
+
+  // Each friend row is built with createElement/textContent: invite labels are user input.
+  function friendMeta(friend) {
+    const quota = Math.max(0, Number(friend.quota_bytes || 0));
+    const used = quota > 0
+      ? `${fmtBytes(friend.used_bytes)} of ${fmtStorageSize(quota)}`
+      : `${fmtBytes(friend.used_bytes)}`;
+    return `${plural(friend.clip_count, 'clip', 'clips')} \u00b7 ${used} \u00b7 Auto-delete ${fmtTtl(friend.ttl_seconds)}`;
+  }
+
+  function renderFriends() {
+    const list = $('r2-friends-list');
+    if (!list) return;
+    list.textContent = '';
+    const friends = r2Stats?.role === 'owner' && Array.isArray(r2Stats.friends) ? r2Stats.friends : [];
+    if (friends.length === 0) {
+      const empty = document.createElement('span');
+      empty.className = 'r2-friend-empty';
+      empty.textContent = 'No friend invites yet.';
+      list.appendChild(empty);
+      return;
+    }
+    for (const friend of friends) {
+      const row = document.createElement('div');
+      row.className = 'r2-friend-row';
+
+      const main = document.createElement('div');
+      main.className = 'r2-friend-main';
+      const name = document.createElement('span');
+      name.className = 'r2-friend-name';
+      name.textContent = friend.label || 'Friend';
+      name.title = name.textContent;
+      const meta = document.createElement('span');
+      meta.className = 'r2-friend-meta';
+      meta.textContent = friendMeta(friend);
+      main.append(name, meta);
+
+      const revoke = document.createElement('button');
+      revoke.type = 'button';
+      revoke.className = 'btn btn-secondary btn-sm';
+      revoke.textContent = 'Revoke';
+      revoke.title = `Revoke the invite for ${friend.label || 'this friend'}`;
+      revoke.dataset.revokeId = friend.id;
+      revoke.disabled = r2Revoking;
+
+      row.append(main, revoke);
+      list.appendChild(row);
+    }
+  }
+
+  function renderR2() {
+    const summary = $('r2-storage-summary');
+    if (!summary) return;
+    const configured = isShareConfigured();
+    const isOwner = r2Stats?.role === 'owner';
+    const view = r2StorageView();
+
+    summary.textContent = view.summary;
+    summary.title = view.summary;
+    summary.classList.toggle('is-muted', view.tone === 'muted');
+    summary.classList.toggle('is-error', view.tone === 'error');
+    $('r2-storage-detail').textContent = view.detail;
+
+    const bar = $('r2-storage-bar');
+    bar.style.width = `${view.pct.toFixed(2)}%`;
+    bar.classList.toggle('is-high', view.pct >= 90);
+
+    const refreshBtn = $('btn-r2-refresh');
+    refreshBtn.disabled = !configured || r2StatsLoading;
+    refreshBtn.textContent = r2StatsLoading ? 'Refreshing\u2026' : 'Refresh';
+
+    // A pasted invite is only needed until both halves of a connection are saved.
+    $('card-r2-invite-import').classList.toggle('is-hidden', configured);
+    $('r2-connection-status').textContent = r2ConnectionLabel();
+    $('btn-r2-disconnect').disabled = !r2ConnectedAny();
+
+    // A TTL the Worker returns but no preset covers must not light up a pill.
+    const ttl = r2Stats ? Number(r2Stats.ttl_seconds || 0) : null;
+    let presetMatched = false;
+    document.querySelectorAll('#seg-r2-ttl .seg-btn').forEach((btn) => {
+      const isActive = ttl !== null && Number(btn.dataset.ttl) === ttl;
+      if (isActive) presetMatched = true;
+      btn.classList.toggle('is-active', isActive);
+      btn.disabled = !configured || r2TtlSaving || r2StatsLoading;
+    });
+    const ttlCaption = r2Stats?.role === 'friend' ? R2_TTL_CAPTION_FRIEND : R2_TTL_CAPTION_OWNER;
+    $('r2-ttl-hint').textContent = ttl !== null && !presetMatched
+      ? `Custom (${fmtTtl(ttl)}) \u00b7 ${ttlCaption}`
+      : ttlCaption;
+
+    // Friends only ever delete their own clips; the bucket-wide wipe is Owner-only.
+    const mineBtn = $('btn-r2-delete-mine');
+    const allBtn = $('btn-r2-delete-all');
+    mineBtn.classList.toggle('is-hidden', !configured);
+    mineBtn.classList.toggle('btn-danger', isOwner);
+    mineBtn.classList.toggle('btn-danger-solid', !isOwner);
+    mineBtn.disabled = !configured || r2Purging;
+    mineBtn.textContent = r2Purging && r2PurgeScope === 'mine'
+      ? 'Deleting\u2026'
+      : (isOwner ? 'Delete my clips' : 'Delete my clips in R2');
+
+    allBtn.classList.toggle('is-hidden', !(configured && isOwner));
+    allBtn.disabled = !configured || r2Purging;
+    allBtn.textContent = r2Purging && r2PurgeScope === 'all'
+      ? 'Deleting\u2026'
+      : "Delete everybody's clips";
+
+    $('card-r2-invites').classList.toggle('is-hidden', !(configured && isOwner));
+    $('btn-r2-create-invite').disabled = !configured || r2InviteCreating;
+    $('btn-r2-create-invite').textContent = r2InviteCreating ? 'Creating\u2026' : 'Create & copy invite';
+    renderFriends();
+
+    syncWindowHeight(true);
+  }
+
+  async function refreshR2Stats({ silent = false } = {}) {
+    if (!isShareConfigured()) {
+      r2Stats = null;
+      r2StatsError = null;
+      r2StatsLoading = false;
+      renderR2();
+      return;
+    }
+    if (r2StatsLoading) return;
+    r2StatsLoading = true;
+    renderR2();
+    try {
+      r2Stats = await invoke('get_r2_stats');
+      r2StatsError = null;
+    } catch (e) {
+      r2Stats = null;
+      r2StatsError = String(e);
+      if (!silent) showToast('error', "Couldn't read R2 storage", String(e));
+    } finally {
+      r2StatsLoading = false;
+      renderR2();
+      syncWindowHeight(true);
+    }
+  }
+
+  async function setR2Ttl(ttl) {
+    if (!isShareConfigured() || r2TtlSaving) return;
+    if (r2Stats && Number(r2Stats.ttl_seconds || 0) === ttl) return;
+    r2TtlSaving = true;
+    renderR2();
+    try {
+      const saved = Number(await invoke('set_r2_ttl', { ttlSeconds: ttl }));
+      if (r2Stats) r2Stats.ttl_seconds = saved;
+      showToast(
+        'info',
+        saved === 0 ? 'Auto-delete off' : 'Auto-delete updated',
+        saved === 0 ? 'Clips stay in R2 until you delete them.' : `Your clips are deleted from R2 after ${fmtTtl(saved)}.`,
+      );
+    } catch (e) {
+      showToast('error', "Couldn't save auto-delete", String(e));
+    } finally {
+      r2TtlSaving = false;
+      renderR2();
+      refreshR2Stats({ silent: true });
+    }
+  }
+
+  async function importR2Invite() {
+    const inp = $('inp-r2-invite');
+    const invite = (inp?.value || '').trim();
+    if (!invite) {
+      showToast('error', 'Invite code missing', 'Paste the clip-cf: invite code first.');
+      return;
+    }
+    const btn = $('btn-r2-import');
+    btn.disabled = true;
+    btn.textContent = 'Connecting\u2026';
+    try {
+      cfg = await invoke('import_cf_invite', { invite });
+      if (inp) inp.value = '';
+      r2Stats = null;
+      r2StatsError = null;
+      renderedStatsKey = null;
+      renderConfig();
+      refreshR2Stats({ silent: true });
+      if (clipsLoadedOnce) await refreshClips({ silent: true });
+      showToast('info', 'Friend invite connected', 'New clips are uploaded to the shared R2 bucket.');
+    } catch (e) {
+      showToast('error', "Couldn't use invite code", String(e));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+    }
+  }
+
+  async function createR2Invite() {
+    if (r2Stats?.role !== 'owner' || r2InviteCreating) return;
+    const labelInp = $('inp-r2-friend-label');
+    const label = (labelInp?.value || '').trim();
+    if (!label) {
+      showToast('error', 'Friend name missing', 'Enter a name for the invite.');
+      labelInp?.focus();
+      return;
+    }
+    const quotaBytes = Number($('sel-r2-friend-quota').value || 0);
+    r2InviteCreating = true;
+    renderR2();
+    try {
+      const friend = await invoke('create_r2_invite', { label, quotaBytes });
+      if (labelInp) labelInp.value = '';
+      showToast('info', 'Invite copied', `Send ${friend?.label || label} the invite code \u2014 it's on your clipboard.`);
+      await refreshR2Stats({ silent: true });
+    } catch (e) {
+      showToast('error', "Couldn't create invite", String(e));
+    } finally {
+      r2InviteCreating = false;
+      renderR2();
+    }
+  }
+
+  function openR2RevokeModal(friend) {
+    if (!friend) return;
+    r2RevokeTarget = friend;
+    $('modal-r2-revoke-title').textContent = `Revoke ${friend.label || 'this friend'}?`;
+    $('modal-r2-revoke-subtitle').textContent = friendMeta(friend);
+    $('chk-r2-revoke-delete').checked = false;
+    $('btn-r2-revoke-confirm').disabled = false;
+    $('btn-r2-revoke-confirm').textContent = 'Revoke';
+    $('modal-r2-revoke').classList.remove('is-hidden');
+    syncWindowHeight(true);
+  }
+
+  function closeR2RevokeModal() {
+    $('modal-r2-revoke').classList.add('is-hidden');
+    r2RevokeTarget = null;
+    syncWindowHeight(true);
+  }
+
+  async function confirmR2Revoke() {
+    if (r2Revoking || !r2RevokeTarget) return;
+    const friend = r2RevokeTarget;
+    const deleteClips = Boolean($('chk-r2-revoke-delete').checked);
+    r2Revoking = true;
+    const btn = $('btn-r2-revoke-confirm');
+    btn.disabled = true;
+    btn.textContent = 'Revoking\u2026';
+    try {
+      const res = await invoke('revoke_r2_invite', { id: friend.id, deleteClips });
+      closeR2RevokeModal();
+      const deleted = Number(res?.deleted_clips || 0);
+      showToast(
+        'info',
+        `Revoked ${friend.label || 'the invite'}`,
+        deleteClips ? `Deleted ${plural(deleted, 'clip', 'clips')} from R2.` : 'Their clips stay in R2.',
+      );
+      await refreshR2Stats({ silent: true });
+      if (deleteClips && clipsLoadedOnce) await refreshClips({ silent: true });
+    } catch (e) {
+      closeR2RevokeModal();
+      showToast('error', "Couldn't revoke invite", String(e));
+    } finally {
+      r2Revoking = false;
+      btn.disabled = false;
+      btn.textContent = 'Revoke';
+      renderR2();
+    }
+  }
+
+  async function openR2PurgeModal(scope) {
+    if (!isShareConfigured() || r2Purging) return;
+    r2PurgeScope = scope === 'all' ? 'all' : 'mine';
+    if (!r2Stats) {
+      await refreshR2Stats();
+    }
+    if (!r2Stats) return;
+    const isOwner = r2Stats.role === 'owner';
+    const mine = r2PurgeScope === 'mine';
+    const clips = mine ? Number(r2Stats.clip_count || 0) : Number(r2Stats.bucket_clip_count || 0);
+    const bytes = mine ? Number(r2Stats.used_bytes || 0) : Number(r2Stats.bucket_used_bytes || 0);
+
+    $('modal-r2-purge-title').textContent = mine
+      ? 'Delete my clips in R2?'
+      : "Delete everybody's clips in R2?";
+    $('modal-r2-purge-subtitle').textContent = mine
+      ? `You: ${plural(clips, 'clip', 'clips')} \u00b7 ${fmtBytes(bytes)}`
+      : `Bucket total: ${plural(clips, 'clip', 'clips')} \u00b7 ${fmtBytes(bytes)}`;
+    $('modal-r2-purge-body').innerHTML = mine
+      ? `Your clips are deleted from R2 and their cached share links stop working.${
+        isOwner ? " Your friends' clips stay untouched." : ''
+      }<br /><br />The .mp4 files in your clips folder on this PC are not touched.`
+      : 'Every clip in your Cloudflare R2 bucket is deleted \u2014 including clips your friends uploaded \u2014 and the cached share links stop working.<br /><br />The .mp4 files in your clips folder on this PC are not touched.';
+
+    const confirmBtn = $('btn-r2-purge-confirm');
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = mine ? 'Delete mine' : 'Delete everybody\u2019s';
+    $('modal-r2-purge').classList.remove('is-hidden');
+    syncWindowHeight(true);
+  }
+
+  function closeR2PurgeModal() {
+    $('modal-r2-purge').classList.add('is-hidden');
+    syncWindowHeight(true);
+  }
+
+  async function confirmR2Purge() {
+    if (r2Purging || !isShareConfigured()) return;
+    const scope = r2PurgeScope;
+    r2Purging = true;
+    const confirmBtn = $('btn-r2-purge-confirm');
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Deleting\u2026';
+    renderR2();
+    try {
+      const res = await invoke('delete_all_r2_clips', { scope });
+      closeR2PurgeModal();
+      const deleted = Number(res?.deleted_objects || 0);
+      showToast(
+        'info',
+        deleted === 1 ? 'Deleted 1 object from R2' : `Deleted ${fmtCount(deleted)} objects from R2`,
+        scope === 'all'
+          ? 'Cached share links were cleared; local .mp4 files are untouched.'
+          : 'Your cached share links were cleared; local .mp4 files are untouched.',
+      );
+      await refreshR2Stats({ silent: true });
+      if (clipsLoadedOnce) await refreshClips({ silent: true });
+    } catch (e) {
+      closeR2PurgeModal();
+      showToast('error', "Couldn't delete R2 clips", String(e));
+    } finally {
+      r2Purging = false;
+      renderR2();
+    }
+  }
+
+  async function disconnectR2() {
+    if (!r2ConnectedAny()) return;
+    const btn = $('btn-r2-disconnect');
+    btn.disabled = true;
+    btn.textContent = 'Disconnecting\u2026';
+    try {
+      cfg = await invoke('disconnect_r2');
+      r2Stats = null;
+      r2StatsError = null;
+      renderedStatsKey = null;
+      renderConfig();
+      showToast(
+        'info',
+        'Disconnected from Cloudflare R2',
+        'Clips in R2 and cached share links were left untouched.',
+      );
+    } catch (e) {
+      showToast('error', "Couldn't disconnect", String(e));
+    } finally {
+      btn.textContent = 'Disconnect';
+      renderR2();
+    }
   }
 
   function estimateClipSizeText(c) {
@@ -1427,6 +1901,7 @@
     // Tabs
     $('tab-clips').addEventListener('click', () => switchTab('clips'));
     $('tab-settings').addEventListener('click', () => switchTab('settings'));
+    $('tab-cloudflare').addEventListener('click', () => switchTab('cloudflare'));
 
     // Clips gallery toolbar & modals
     $('btn-clips-select').addEventListener('click', () => {
@@ -1498,6 +1973,8 @@
       const renameOpen = !$('modal-rename-clip').classList.contains('is-hidden');
       const deleteOpen = !$('modal-delete-clips').classList.contains('is-hidden');
       const quitOpen = !$('modal-quit').classList.contains('is-hidden');
+      const purgeOpen = !$('modal-r2-purge').classList.contains('is-hidden');
+      const revokeOpen = !$('modal-r2-revoke').classList.contains('is-hidden');
       const menuOpen = !$('clip-context-menu').classList.contains('is-hidden');
 
       if (e.key === 'Escape') {
@@ -1507,6 +1984,10 @@
           closeRenameModal();
         } else if (deleteOpen) {
           closeDeleteModal();
+        } else if (purgeOpen) {
+          closeR2PurgeModal();
+        } else if (revokeOpen) {
+          closeR2RevokeModal();
         } else if (quitOpen) {
           $('modal-quit').classList.add('is-hidden');
         } else if (activeTab === 'clips' && (selectMode || selectedClipPaths.size > 0)) {
@@ -1515,7 +1996,7 @@
         return;
       }
 
-      if (renameOpen || deleteOpen || quitOpen) return;
+      if (renameOpen || deleteOpen || quitOpen || purgeOpen || revokeOpen) return;
       const tag = (document.activeElement && document.activeElement.tagName) || '';
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
 
@@ -1721,6 +2202,12 @@
         const el = $('inp-share-key');
         if (el) el.value = '';
         renderConfig();
+        // A replaced key may be the one that made the last stats call fail, so retry it right away.
+        if (key && isShareConfigured()) {
+          r2Stats = null;
+          r2StatsError = null;
+          refreshR2Stats({ silent: true });
+        }
         showToast('info', key ? 'Upload key saved' : 'Upload key cleared', '');
       } catch (e) {
         showToast('error', "Couldn't save upload key", String(e));
@@ -1757,6 +2244,43 @@
         commitShareKey('');
       });
     }
+
+    // Cloudflare R2 tab: connection, storage, auto-delete, invites and the R2 wipes
+    $('btn-r2-refresh').addEventListener('click', () => refreshR2Stats());
+    $('btn-r2-disconnect').addEventListener('click', disconnectR2);
+    $('btn-r2-import').addEventListener('click', importR2Invite);
+    $('inp-r2-invite').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        importR2Invite();
+      }
+    });
+    document.querySelectorAll('#seg-r2-ttl .seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => setR2Ttl(Number(btn.dataset.ttl)));
+    });
+    $('btn-r2-delete-mine').addEventListener('click', () => openR2PurgeModal('mine'));
+    $('btn-r2-delete-all').addEventListener('click', () => openR2PurgeModal('all'));
+    $('btn-r2-purge-cancel').addEventListener('click', closeR2PurgeModal);
+    $('btn-r2-purge-x').addEventListener('click', closeR2PurgeModal);
+    $('btn-r2-purge-confirm').addEventListener('click', confirmR2Purge);
+
+    $('btn-r2-create-invite').addEventListener('click', createR2Invite);
+    $('inp-r2-friend-label').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        createR2Invite();
+      }
+    });
+    // One delegated handler keeps the revoke buttons working as the list re-renders.
+    $('r2-friends-list').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-revoke-id]');
+      if (!btn) return;
+      const friend = (r2Stats?.friends || []).find((f) => f.id === btn.dataset.revokeId);
+      openR2RevokeModal(friend);
+    });
+    $('btn-r2-revoke-cancel').addEventListener('click', closeR2RevokeModal);
+    $('btn-r2-revoke-x').addEventListener('click', closeR2RevokeModal);
+    $('btn-r2-revoke-confirm').addEventListener('click', confirmR2Revoke);
 
     // Status bar controls
     $('chk-status-enabled').addEventListener('change', async () => {

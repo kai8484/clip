@@ -1215,6 +1215,148 @@ html, body {
   gap: 6px;
 }
 
+/* Cloudflare R2 tab */
+.disconnect-control,
+.r2-storage-control {
+  justify-content: space-between;
+}
+
+.disconnect-control .btn,
+.r2-storage-control .btn {
+  flex-shrink: 0;
+}
+
+.r2-storage-summary {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-md);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.r2-storage-summary.is-muted {
+  color: var(--muted);
+}
+
+.r2-storage-summary.is-error {
+  font-size: var(--fs-sm);
+  color: var(--danger);
+}
+
+.r2-storage-detail {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.r2-storage-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #131314;
+  overflow: hidden;
+}
+
+.r2-storage-bar {
+  width: 0;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
+.r2-storage-bar.is-high {
+  background: var(--danger);
+}
+
+/* Caption under the auto-delete presets: wraps instead of truncating */
+.r2-hint {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* Friend invite import and the Owner's invite list */
+.invite-control .text-input,
+.invite-create-control .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.invite-create-control {
+  gap: 6px;
+}
+
+.invite-create-control .select-input {
+  flex: 0 0 auto;
+  width: 104px;
+}
+
+.r2-friends-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.r2-friend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  background: #131314;
+}
+
+.r2-friend-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.r2-friend-name {
+  font-size: var(--fs-md);
+  color: var(--text);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.r2-friend-meta {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.r2-friend-empty {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+/* Two danger buttons must fit next to the hint on narrow windows */
+.clear-r2-control {
+  flex-wrap: wrap;
+}
+
+.modal-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.modal-check input {
+  accent-color: var(--danger);
+}
+
 /* Rename modal input */
 .rename-input-row {
   display: flex;

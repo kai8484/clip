@@ -147,6 +147,34 @@ fn base64url_no_pad(bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes base64url that may or may not carry `=` padding (invite codes are unpadded).
+fn base64url_decode_no_pad(raw: &str) -> Result<Vec<u8>, String> {
+    let unpadded = raw.trim_end_matches('=');
+    if raw.len() - unpadded.len() > 2 || unpadded.len() % 4 == 1 {
+        return Err("Invite code is not valid base64url.".into());
+    }
+    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for byte in unpadded.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return Err("Invite code is not valid base64url.".into()),
+        } as u32;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Validates and normalizes a Worker base URL (`https://...`, or `http://localhost` for local dev).
 pub fn normalize_base_url(raw: &str) -> Result<String, String> {
     let parsed = parse_base_url(raw)?;
@@ -156,7 +184,7 @@ pub fn normalize_base_url(raw: &str) -> Result<String, String> {
 fn parse_base_url(raw: &str) -> Result<ParsedUrl, String> {
     let mut s = raw.trim().trim_end_matches('/').to_string();
     if s.is_empty() {
-        return Err("Set Share URL in Settings first.".into());
+        return Err("Set Share URL in the Cloudflare tab first.".into());
     }
     if !s.contains("://") {
         s = format!("https://{s}");
@@ -231,23 +259,39 @@ fn percent_encode_header(s: &str) -> String {
     out
 }
 
-fn winhttp_put_file(
+/// Request body for [`winhttp_request`], resolved to a `Content-Length` before sending.
+enum WinHttpBody<'a> {
+    None,
+    Memory(&'a [u8]),
+    File(&'a Path),
+}
+
+impl WinHttpBody<'_> {
+    fn total_len(&self) -> Result<u32, String> {
+        let bytes = match self {
+            Self::None => return Ok(0),
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::File(path) => std::fs::metadata(path)
+                .map_err(|e| format!("Failed to read clip size: {e}"))?
+                .len(),
+        };
+        u32::try_from(bytes)
+            .map_err(|_| "Clip is too large to upload in one request (over 4 GB).".to_string())
+    }
+}
+
+/// One authenticated WinHTTP request: connect, send headers and body, read status and response.
+fn winhttp_request(
     session: *mut c_void,
     parsed: &ParsedUrl,
+    method: PCWSTR,
     upload_key: &str,
     path_suffix: &str,
     headers: &[String],
-    file_path: Option<&Path>,
-    mem_bytes: Option<&[u8]>,
+    body: WinHttpBody<'_>,
 ) -> Result<(u32, String), String> {
     let req_path = format!("{}{}", parsed.base_path, path_suffix);
-    let total_len_u64 = match (file_path, mem_bytes) {
-        (Some(p), None) => std::fs::metadata(p).map_err(|e| format!("Failed to read clip size: {e}"))?.len(),
-        (None, Some(b)) => b.len() as u64,
-        _ => return Err("Internal upload error.".into()),
-    };
-    let total_len = u32::try_from(total_len_u64)
-        .map_err(|_| "Clip is too large to upload in one request (over 4 GB).".to_string())?;
+    let total_len = body.total_len()?;
 
     unsafe {
         let conn = HttpHandle(WinHttpConnect(session, &HSTRING::from(parsed.host.as_str()), parsed.port, 0));
@@ -258,7 +302,7 @@ fn winhttp_put_file(
         let flags = if parsed.https { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
         let req = HttpHandle(WinHttpOpenRequest(
             conn.0,
-            w!("PUT"),
+            method,
             &HSTRING::from(req_path.as_str()),
             PCWSTR::null(),
             PCWSTR::null(),
@@ -284,26 +328,31 @@ fn winhttp_put_file(
         .map_err(|e| format!("Failed to set request headers: {e}"))?;
 
         WinHttpSendRequest(req.0, None, None, 0, total_len, 0)
-            .map_err(|e| format!("Failed to send upload request: {e}"))?;
+            .map_err(|e| format!("Failed to send request: {e}"))?;
 
-        if let Some(p) = file_path {
-            let mut f = File::open(p).map_err(|e| format!("Failed to open clip file: {e}"))?;
-            let mut buf = vec![0u8; CHUNK_BYTES];
-            loop {
-                let n = f.read(&mut buf).map_err(|e| format!("Failed to read clip file: {e}"))?;
-                if n == 0 {
-                    break;
+        match &body {
+            // Stream files in fixed chunks so a multi-GB clip never sits in memory.
+            WinHttpBody::File(path) => {
+                let mut f = File::open(path).map_err(|e| format!("Failed to open clip file: {e}"))?;
+                let mut buf = vec![0u8; CHUNK_BYTES];
+                loop {
+                    let n = f.read(&mut buf).map_err(|e| format!("Failed to read clip file: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    write_all_winhttp(req.0, &buf[..n])?;
                 }
-                write_all_winhttp(req.0, &buf[..n])?;
             }
-        } else if let Some(b) = mem_bytes {
-            for chunk in b.chunks(CHUNK_BYTES) {
-                write_all_winhttp(req.0, chunk)?;
+            WinHttpBody::Memory(bytes) => {
+                for chunk in bytes.chunks(CHUNK_BYTES) {
+                    write_all_winhttp(req.0, chunk)?;
+                }
             }
+            WinHttpBody::None => {}
         }
 
         WinHttpReceiveResponse(req.0, std::ptr::null_mut())
-            .map_err(|e| format!("Failed to receive upload response: {e}"))?;
+            .map_err(|e| format!("Failed to receive response: {e}"))?;
 
         let mut status: u32 = 0;
         let mut status_len = std::mem::size_of::<u32>() as u32;
@@ -333,6 +382,44 @@ fn winhttp_put_file(
 
         Ok((status, String::from_utf8_lossy(&resp_bytes).into_owned()))
     }
+}
+
+/// Streams a `PUT` upload (clip or thumbnail) and returns the status plus response body.
+fn winhttp_put_file(
+    session: *mut c_void,
+    parsed: &ParsedUrl,
+    upload_key: &str,
+    path_suffix: &str,
+    headers: &[String],
+    file_path: Option<&Path>,
+    mem_bytes: Option<&[u8]>,
+) -> Result<(u32, String), String> {
+    let body = match (file_path, mem_bytes) {
+        (Some(path), None) => WinHttpBody::File(path),
+        (None, Some(bytes)) => WinHttpBody::Memory(bytes),
+        _ => return Err("Internal upload error.".into()),
+    };
+    winhttp_request(session, parsed, w!("PUT"), upload_key, path_suffix, headers, body)
+}
+
+/// Opens a WinHTTP session with the app's user agent, proxy defaults and timeouts.
+fn open_winhttp_session() -> Result<HttpHandle, String> {
+    let session = unsafe {
+        HttpHandle(WinHttpOpen(
+            w!("clip/0.3"),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        ))
+    };
+    if session.0.is_null() {
+        return Err(format!("Failed to initialize HTTP client ({})", windows::core::Error::from_win32()));
+    }
+    unsafe {
+        let _ = WinHttpSetTimeouts(session.0, 10_000, 15_000, 60_000, 120_000);
+    }
+    Ok(session)
 }
 
 unsafe fn write_all_winhttp(req: *mut c_void, mut data: &[u8]) -> Result<(), String> {
@@ -365,7 +452,7 @@ pub fn upload_clip(
 ) -> Result<ShareResult, String> {
     let key = upload_key.trim();
     if key.is_empty() {
-        return Err("Set Upload key in Settings first.".into());
+        return Err("Set Upload key in the Cloudflare tab first.".into());
     }
     if key.chars().any(|c| c == '\r' || c == '\n') {
         return Err("Upload key contains invalid characters.".into());
@@ -375,21 +462,7 @@ pub fn upload_clip(
     // Each share gets a fresh unguessable slug; the clip date/time stays the display title.
     let slug = random_share_slug()?;
 
-    let session = unsafe {
-        HttpHandle(WinHttpOpen(
-            w!("clip/0.3"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        ))
-    };
-    if session.0.is_null() {
-        return Err(format!("Failed to initialize HTTP client ({})", windows::core::Error::from_win32()));
-    }
-    unsafe {
-        let _ = WinHttpSetTimeouts(session.0, 10_000, 15_000, 60_000, 120_000);
-    }
+    let session = open_winhttp_session()?;
 
     let mut has_thumb = false;
     if let Some(png) = meta.thumb_png.filter(|b| !b.is_empty()) {
@@ -433,7 +506,7 @@ pub fn upload_clip(
 
     let parsed_resp = serde_json::from_str::<WorkerUploadResponse>(&body).ok();
     if status == 401 || status == 403 {
-        return Err("Upload rejected: check Upload key in Settings.".into());
+        return Err("Upload rejected: check Upload key in the Cloudflare tab.".into());
     }
     if !(200..300).contains(&status) {
         let detail = parsed_resp
@@ -465,6 +538,338 @@ pub fn upload_clip(
         video_url,
         slug: final_slug,
     })
+}
+
+/// Bucket state reported by the Worker's `/admin/stats`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct R2Stats {
+    // The Worker speaks camelCase, Tauri IPC (and app.js) snake_case.
+    pub role: String,
+    pub label: Option<String>,
+    #[serde(rename(deserialize = "usedBytes"))]
+    pub used_bytes: u64,
+    #[serde(rename(deserialize = "clipCount"))]
+    pub clip_count: u64,
+    #[serde(rename(deserialize = "objectCount"))]
+    pub object_count: u64,
+    #[serde(rename(deserialize = "expiredCount"))]
+    pub expired_count: u64,
+    #[serde(rename(deserialize = "bucketUsedBytes"))]
+    pub bucket_used_bytes: u64,
+    #[serde(rename(deserialize = "bucketClipCount"))]
+    pub bucket_clip_count: u64,
+    #[serde(rename(deserialize = "bucketObjectCount"))]
+    pub bucket_object_count: u64,
+    #[serde(rename(deserialize = "freeTierBytes"))]
+    pub free_tier_bytes: u64,
+    #[serde(rename(deserialize = "quotaBytes"))]
+    pub quota_bytes: u64,
+    #[serde(rename(deserialize = "ttlSeconds"))]
+    pub ttl_seconds: u64,
+    pub friends: Vec<R2Friend>,
+}
+
+/// One friend invite as listed in the Owner's `/admin/stats`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct R2Friend {
+    pub id: String,
+    pub label: String,
+    #[serde(rename(deserialize = "ttlSeconds"))]
+    pub ttl_seconds: u64,
+    #[serde(rename(deserialize = "quotaBytes"))]
+    pub quota_bytes: u64,
+    /// Epoch milliseconds, as sent by the Worker (`Date.now()`).
+    #[serde(rename(deserialize = "createdAt"))]
+    pub created_at: u64,
+    #[serde(rename(deserialize = "usedBytes"))]
+    pub used_bytes: u64,
+    #[serde(rename(deserialize = "clipCount"))]
+    pub clip_count: u64,
+    #[serde(rename(deserialize = "objectCount"))]
+    pub object_count: u64,
+}
+
+/// Outcome of deleting clips (`scope` = `mine` or `all`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PurgeR2Result {
+    pub scope: String,
+    #[serde(rename(deserialize = "deletedObjects"))]
+    pub deleted_objects: u64,
+    #[serde(rename(deserialize = "deletedClips"))]
+    pub deleted_clips: u64,
+}
+
+/// A freshly minted invite. `invite_code` embeds the raw token, so it never crosses IPC: the Tauri
+/// layer copies it to the clipboard and hands the webview only [`R2Friend`].
+pub struct CreatedR2Invite {
+    pub friend: R2Friend,
+    pub invite_code: String,
+}
+
+/// Outcome of revoking one friend invite.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeInviteResult {
+    pub id: String,
+    #[serde(rename(deserialize = "deletedObjects"))]
+    pub deleted_objects: u64,
+    #[serde(rename(deserialize = "deletedClips"))]
+    pub deleted_clips: u64,
+}
+
+const ADMIN_STATS_PATH: &str = "/admin/stats";
+const ADMIN_SETTINGS_PATH: &str = "/admin/settings";
+const ADMIN_CLIPS_PATH: &str = "/admin/clips";
+const ADMIN_INVITES_PATH: &str = "/admin/invites";
+const INVITE_PREFIX: &str = "clip-cf:";
+
+#[derive(Deserialize)]
+struct WorkerError {
+    error: Option<String>,
+}
+
+/// One authenticated `/admin/*` call, returning the raw status and response body.
+fn admin_request(
+    base_url: &str,
+    upload_key: &str,
+    method: PCWSTR,
+    path: &str,
+    json_body: Option<&[u8]>,
+) -> Result<(u32, String), String> {
+    let key = upload_key.trim();
+    if key.is_empty() {
+        return Err("Set Upload key first.".into());
+    }
+    if key.chars().any(|c| c == '\r' || c == '\n') {
+        return Err("Upload key contains invalid characters.".into());
+    }
+    let parsed = parse_base_url(base_url)?;
+    let session = open_winhttp_session()?;
+    let headers = if json_body.is_some() {
+        vec!["Content-Type: application/json".to_string()]
+    } else {
+        Vec::new()
+    };
+    let body = match json_body {
+        Some(bytes) => WinHttpBody::Memory(bytes),
+        None => WinHttpBody::None,
+    };
+    winhttp_request(session.0, &parsed, method, key, path, &headers, body)
+}
+
+/// Turns a failed admin response into a message the UI can show verbatim.
+fn admin_failure(action: &str, status: u32, body: &str) -> String {
+    // Parse the Worker's JSON error first: `/admin/invites/*` answers 404 for an unknown invite,
+    // which must not be mistaken for a stale Worker deployment.
+    let worker_error = serde_json::from_str::<WorkerError>(body).ok();
+    let detail = worker_error
+        .as_ref()
+        .and_then(|e| e.error.as_deref())
+        .filter(|s| !s.is_empty());
+    // A Worker deployed before the admin API existed answers 404/405 without JSON.
+    if matches!(status, 404 | 405) && detail.is_none() {
+        return "Worker needs redeploy: run npx wrangler deploy in worker/.".to_string();
+    }
+    if status == 403 {
+        return "Action not allowed for a friend invite.".to_string();
+    }
+    if status == 401 {
+        return "Admin request rejected: check Upload key.".to_string();
+    }
+    let text = match detail {
+        Some(detail) => detail.to_string(),
+        None => body.trim().chars().take(160).collect(),
+    };
+    if text.is_empty() {
+        format!("Failed to {action} (HTTP {status}).")
+    } else {
+        format!("Failed to {action} (HTTP {status}): {text}")
+    }
+}
+
+fn parse_worker_json<T: for<'de> Deserialize<'de>>(what: &str, body: &str) -> Result<T, String> {
+    serde_json::from_str(body).map_err(|e| format!("Unexpected {what} response from the Worker: {e}"))
+}
+
+/// Reads storage usage, clip counts and the current auto-delete TTL from the Worker.
+pub fn fetch_r2_stats(base_url: &str, upload_key: &str) -> Result<R2Stats, String> {
+    let (status, body) = admin_request(base_url, upload_key, w!("GET"), ADMIN_STATS_PATH, None)?;
+    if !(200..300).contains(&status) {
+        return Err(admin_failure("read R2 storage", status, &body));
+    }
+    parse_worker_json("storage", &body)
+}
+
+/// Sets how long clips live in R2 (`0` keeps them forever) and returns the stored value.
+pub fn set_r2_ttl(base_url: &str, upload_key: &str, ttl_seconds: u64) -> Result<u64, String> {
+    let payload = serde_json::json!({ "ttlSeconds": ttl_seconds }).to_string();
+    let (status, body) = admin_request(
+        base_url,
+        upload_key,
+        w!("PUT"),
+        ADMIN_SETTINGS_PATH,
+        Some(payload.as_bytes()),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(admin_failure("save the auto-delete setting", status, &body));
+    }
+    let saved: R2StatsSettings = parse_worker_json("settings", &body)?;
+    Ok(saved.ttl_seconds)
+}
+
+#[derive(Deserialize)]
+struct R2StatsSettings {
+    #[serde(rename = "ttlSeconds")]
+    ttl_seconds: u64,
+}
+
+/// Deletes the caller's clips (`mine`) or every clip in the bucket (`all`).
+pub fn delete_all_r2_clips(
+    base_url: &str,
+    upload_key: &str,
+    scope: &str,
+) -> Result<PurgeR2Result, String> {
+    let scope = scope.trim();
+    if !matches!(scope, "mine" | "all") {
+        return Err("Delete scope must be \"mine\" or \"all\".".into());
+    }
+    let path = format!("{ADMIN_CLIPS_PATH}?scope={scope}");
+    let (status, body) = admin_request(base_url, upload_key, w!("DELETE"), &path, None)?;
+    if !(200..300).contains(&status) {
+        let action = if scope == "all" { "delete every R2 clip" } else { "delete your R2 clips" };
+        return Err(admin_failure(action, status, &body));
+    }
+    parse_worker_json("delete", &body)
+}
+
+/// Worker's `POST /admin/invites` payload back to us; `token` is the secret half of the invite.
+#[derive(Deserialize)]
+struct WorkerInviteResponse {
+    id: String,
+    label: String,
+    token: String,
+    #[serde(rename = "ttlSeconds")]
+    ttl_seconds: u64,
+    #[serde(rename = "quotaBytes")]
+    quota_bytes: u64,
+    /// Epoch milliseconds, as sent by the Worker (`Date.now()`).
+    #[serde(rename = "createdAt")]
+    created_at: u64,
+}
+
+impl WorkerInviteResponse {
+    fn into_created_invite(self, invite_code: String) -> CreatedR2Invite {
+        CreatedR2Invite {
+            friend: R2Friend {
+                id: self.id,
+                label: self.label,
+                ttl_seconds: self.ttl_seconds,
+                quota_bytes: self.quota_bytes,
+                created_at: self.created_at,
+                used_bytes: 0,
+                clip_count: 0,
+                object_count: 0,
+            },
+            invite_code,
+        }
+    }
+}
+
+/// Mints a friend invite and packs its base URL + token into a shareable `clip-cf:` code.
+pub fn create_r2_invite(
+    base_url: &str,
+    upload_key: &str,
+    label: &str,
+    quota_bytes: u64,
+) -> Result<CreatedR2Invite, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("Enter a name for the friend invite.".into());
+    }
+    if label.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err("Friend name must be a single line.".into());
+    }
+    let payload = serde_json::json!({ "label": label, "quotaBytes": quota_bytes }).to_string();
+    let (status, body) = admin_request(
+        base_url,
+        upload_key,
+        w!("POST"),
+        ADMIN_INVITES_PATH,
+        Some(payload.as_bytes()),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(admin_failure("create the friend invite", status, &body));
+    }
+    let resp: WorkerInviteResponse = parse_worker_json("invite", &body)?;
+    let invite_code = encode_invite_code(base_url, &resp.token)?;
+    Ok(resp.into_created_invite(invite_code))
+}
+
+/// Revokes one friend invite, optionally deleting the clips its holder uploaded.
+pub fn revoke_r2_invite(
+    base_url: &str,
+    upload_key: &str,
+    id: &str,
+    delete_clips: bool,
+) -> Result<RevokeInviteResult, String> {
+    let id = id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invite id is invalid.".into());
+    }
+    let path = format!("{ADMIN_INVITES_PATH}/{id}?deleteClips={}", u8::from(delete_clips));
+    let (status, body) = admin_request(base_url, upload_key, w!("DELETE"), &path, None)?;
+    if !(200..300).contains(&status) {
+        return Err(admin_failure("revoke the friend invite", status, &body));
+    }
+    parse_worker_json("revoke", &body)
+}
+
+/// Decoded `clip-cf:` invite code payload.
+#[derive(Deserialize)]
+struct InvitePayload {
+    v: u32,
+    url: String,
+    key: String,
+}
+
+/// Packs a Worker base URL and upload key into a `clip-cf:` invite code for a friend.
+pub fn encode_invite_code(base_url: &str, upload_key: &str) -> Result<String, String> {
+    let base = normalize_base_url(base_url)?;
+    let key = upload_key.trim();
+    if key.is_empty() {
+        return Err("Invite has no upload key.".into());
+    }
+    if key.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err("Upload key contains invalid characters.".into());
+    }
+    let payload = serde_json::json!({ "v": 1, "url": base, "key": key });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| format!("Failed to pack invite code: {e}"))?;
+    Ok(format!("{INVITE_PREFIX}{}", base64url_no_pad(&bytes)))
+}
+
+/// Unpacks a `clip-cf:` invite code into a normalized base URL and its upload key.
+pub fn decode_invite_code(raw: &str) -> Result<(String, String), String> {
+    let trimmed = raw.trim();
+    let encoded = trimmed
+        .strip_prefix(INVITE_PREFIX)
+        .ok_or_else(|| "Invite code must start with clip-cf:.".to_string())?;
+    if encoded.is_empty() {
+        return Err("Invite code is empty.".into());
+    }
+    let bytes = base64url_decode_no_pad(encoded)?;
+    let payload: InvitePayload = serde_json::from_slice(&bytes)
+        .map_err(|_| "Invite code is damaged or incomplete.".to_string())?;
+    if payload.v != 1 {
+        return Err(format!("Invite code version {} is not supported.", payload.v));
+    }
+    let base = normalize_base_url(&payload.url)?;
+    let key = payload.key.trim();
+    if key.is_empty() {
+        return Err("Invite code has no upload key.".into());
+    }
+    if key.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err("Invite code has an invalid upload key.".into());
+    }
+    Ok((base, key.to_string()))
 }
 
 /// Opens the Windows clipboard, retrying while another process holds it, and closes it afterwards.
@@ -670,6 +1075,23 @@ impl ShareStore {
         if self.lock_records().remove(&share_record_key(path)).is_some() {
             self.persist();
         }
+    }
+
+    /// Forgets every cached upload pointing at `base_url`, e.g. after the bucket was wiped.
+    ///
+    /// Returns how many records were dropped so the caller can skip work when nothing matched.
+    pub fn remove_for_base(&self, base_url: &str) -> usize {
+        let wanted = base_url.trim().trim_end_matches('/');
+        let removed = {
+            let mut records = self.lock_records();
+            let before = records.len();
+            records.retain(|_, rec| rec.base_url.trim_end_matches('/') != wanted);
+            before - records.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
     }
 
     pub fn migrate(&self, from: &Path, to: &Path) {
@@ -1013,6 +1435,253 @@ mod tests {
         assert!(!matches(&store, clip, base));
         assert!(!matches(&ShareStore::load(path), clip, base));
         store.remove(clip);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r2_stats_deserialize_worker_camel_case_fields() {
+        let stats: R2Stats = serde_json::from_str(
+            r#"{"ok":true,"role":"owner","label":null,"usedBytes":44302417,"clipCount":4,"objectCount":8,"expiredCount":1,"bucketUsedBytes":90000000,"bucketClipCount":9,"bucketObjectCount":18,"freeTierBytes":10000000000,"quotaBytes":0,"ttlSeconds":259200,"friends":[{"id":"inv_1","label":"Alex","ttlSeconds":604800,"quotaBytes":2000000000,"createdAt":1795785000000,"usedBytes":1234,"clipCount":2,"objectCount":4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            R2Stats {
+                role: "owner".to_string(),
+                label: None,
+                used_bytes: 44_302_417,
+                clip_count: 4,
+                object_count: 8,
+                expired_count: 1,
+                bucket_used_bytes: 90_000_000,
+                bucket_clip_count: 9,
+                bucket_object_count: 18,
+                free_tier_bytes: 10_000_000_000,
+                quota_bytes: 0,
+                ttl_seconds: 259_200,
+                friends: vec![R2Friend {
+                    id: "inv_1".to_string(),
+                    label: "Alex".to_string(),
+                    ttl_seconds: 604_800,
+                    quota_bytes: 2_000_000_000,
+                    created_at: 1_795_785_000_000,
+                    used_bytes: 1_234,
+                    clip_count: 2,
+                    object_count: 4,
+                }],
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&stats).unwrap(),
+            concat!(
+                r#"{"role":"owner","label":null,"used_bytes":44302417,"clip_count":4,"object_count":8,"expired_count":1,"bucket_used_bytes":90000000,"bucket_clip_count":9,"bucket_object_count":18,"free_tier_bytes":10000000000,"quota_bytes":0,"ttl_seconds":259200,"friends":["#,
+                r#"{"id":"inv_1","label":"Alex","ttl_seconds":604800,"quota_bytes":2000000000,"created_at":1795785000000,"used_bytes":1234,"clip_count":2,"object_count":4}]}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn invite_response_deserialize_numeric_created_at_ms() {
+        let resp: WorkerInviteResponse = serde_json::from_str(
+            r#"{"ok":true,"id":"f_1a2b3c4d","label":"Alex","token":"dG9rZW4","ttlSeconds":604800,"quotaBytes":2000000000,"createdAt":1795785000000}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.created_at, 1_795_785_000_000u64);
+        assert_eq!(resp.ttl_seconds, 604_800);
+        assert_eq!(resp.quota_bytes, 2_000_000_000);
+
+        let created = resp.into_created_invite("clip-cf:example".to_string());
+        assert_eq!(created.invite_code, "clip-cf:example");
+        assert_eq!(
+            created.friend,
+            R2Friend {
+                id: "f_1a2b3c4d".to_string(),
+                label: "Alex".to_string(),
+                ttl_seconds: 604_800,
+                quota_bytes: 2_000_000_000,
+                created_at: 1_795_785_000_000,
+                used_bytes: 0,
+                clip_count: 0,
+                object_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn r2_stats_deserialize_friend_role_with_quota() {
+        let stats: R2Stats = serde_json::from_str(
+            r#"{"ok":true,"role":"friend","label":"Alex","usedBytes":500,"clipCount":1,"objectCount":2,"expiredCount":0,"bucketUsedBytes":9000,"bucketClipCount":3,"bucketObjectCount":6,"freeTierBytes":10000000000,"quotaBytes":2000000000,"ttlSeconds":0,"friends":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(stats.role, "friend");
+        assert_eq!(stats.label.as_deref(), Some("Alex"));
+        assert_eq!(stats.quota_bytes, 2_000_000_000);
+        assert!(stats.friends.is_empty());
+    }
+
+    #[test]
+    fn purge_result_deserialize_worker_camel_case_fields() {
+        let result: PurgeR2Result = serde_json::from_str(
+            r#"{"ok":true,"scope":"all","deletedObjects":8,"deletedClips":4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            PurgeR2Result {
+                scope: "all".to_string(),
+                deleted_objects: 8,
+                deleted_clips: 4,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"scope":"all","deleted_objects":8,"deleted_clips":4}"#
+        );
+    }
+
+    #[test]
+    fn revoke_result_deserialize_worker_camel_case_fields() {
+        let result: RevokeInviteResult = serde_json::from_str(
+            r#"{"ok":true,"id":"inv_1","deletedObjects":3,"deletedClips":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            RevokeInviteResult {
+                id: "inv_1".to_string(),
+                deleted_objects: 3,
+                deleted_clips: 2,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"id":"inv_1","deleted_objects":3,"deleted_clips":2}"#
+        );
+    }
+
+    #[test]
+    fn invite_code_round_trips_both_ways() {
+        let encoded = encode_invite_code("https://clips.example.com/", " s3cret ").unwrap();
+        assert!(encoded.starts_with("clip-cf:"));
+        assert_eq!(
+            decode_invite_code(&encoded).unwrap(),
+            ("https://clips.example.com".to_string(), "s3cret".to_string())
+        );
+        // Pasted codes often carry surrounding whitespace.
+        assert_eq!(
+            decode_invite_code(&format!("  {encoded}\n")).unwrap(),
+            ("https://clips.example.com".to_string(), "s3cret".to_string())
+        );
+    }
+
+    #[test]
+    fn invite_code_accepts_padded_base64url() {
+        let encoded = encode_invite_code("https://clips.example.com", "key").unwrap();
+        let raw = encoded.strip_prefix("clip-cf:").unwrap();
+        let mut padded = raw.to_string();
+        while padded.len() % 4 != 0 {
+            padded.push('=');
+        }
+        assert_eq!(
+            decode_invite_code(&format!("clip-cf:{padded}")).unwrap(),
+            ("https://clips.example.com".to_string(), "key".to_string())
+        );
+    }
+
+    #[test]
+    fn invite_code_rejects_bad_input() {
+        let err = decode_invite_code("https://clips.example.com").unwrap_err();
+        assert!(err.contains("clip-cf:"), "{err}");
+
+        let err = decode_invite_code("clip-cf:").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+
+        let err = decode_invite_code("clip-cf:not*base64").unwrap_err();
+        assert!(err.contains("base64url"), "{err}");
+
+        let err = decode_invite_code(&format!(
+            "clip-cf:{}",
+            base64url_no_pad(b"not json")
+        ))
+        .unwrap_err();
+        assert!(err.contains("damaged"), "{err}");
+
+        let http = base64url_no_pad(br#"{"v":1,"url":"http://clips.example.com","key":"k"}"#);
+        let err = decode_invite_code(&format!("clip-cf:{http}")).unwrap_err();
+        assert!(err.contains("https"), "{err}");
+
+        let newline = base64url_no_pad(br#"{"v":1,"url":"https://clips.example.com","key":"a\nb"}"#);
+        let err = decode_invite_code(&format!("clip-cf:{newline}")).unwrap_err();
+        assert!(err.contains("upload key"), "{err}");
+
+        let empty_key = base64url_no_pad(br#"{"v":1,"url":"https://clips.example.com","key":"  "}"#);
+        let err = decode_invite_code(&format!("clip-cf:{empty_key}")).unwrap_err();
+        assert!(err.contains("no upload key"), "{err}");
+
+        let old = base64url_no_pad(br#"{"v":2,"url":"https://clips.example.com","key":"k"}"#);
+        let err = decode_invite_code(&format!("clip-cf:{old}")).unwrap_err();
+        assert!(err.contains("version 2"), "{err}");
+    }
+
+    #[test]
+    fn encode_invite_code_rejects_bad_targets() {
+        assert!(encode_invite_code("https://clips.example.com", "  ").is_err());
+        assert!(encode_invite_code("https://clips.example.com", "a\nb").is_err());
+        assert!(encode_invite_code("http://clips.example.com", "key").is_err());
+    }
+
+    #[test]
+    fn base64url_decode_no_pad_matches_encoder() {
+        for bytes in [&b""[..], &b"f"[..], &b"fo"[..], &b"foo"[..], &b"foobar"[..], &[0xfb, 0xff][..]] {
+            let encoded = base64url_no_pad(bytes);
+            assert_eq!(base64url_decode_no_pad(&encoded).unwrap(), bytes);
+        }
+        assert!(base64url_decode_no_pad("Zg=").is_ok());
+        assert!(base64url_decode_no_pad("a").is_err());
+        assert!(base64url_decode_no_pad("=== ").is_err());
+    }
+
+    #[test]
+    fn admin_failure_explains_common_rejections() {
+        assert!(admin_failure("read", 404, "Not Found")
+            .contains("Worker needs redeploy"));
+        assert!(admin_failure("read", 405, "").contains("Worker needs redeploy"));
+        assert!(admin_failure("revoke", 401, "")
+            .contains("check Upload key"));
+        assert!(admin_failure("create", 403, "")
+            .contains("Action not allowed for a friend invite."));
+        // An invite that no longer exists must surface the Worker's own message.
+        let not_found = admin_failure("revoke", 404, r#"{"error":"Invite not found"}"#);
+        assert!(not_found.contains("Invite not found"), "{not_found}");
+        assert!(!not_found.contains("redeploy"), "{not_found}");
+    }
+
+    #[test]
+    fn share_store_remove_for_base_clears_only_that_worker() {
+        let dir = test_store_dir("remove-base");
+        let path = dir.join("share-records.json");
+        let store = ShareStore::load(path.clone());
+        let base = "https://clips.example.com";
+        let other = "https://other.example.com";
+        let first = Path::new(r"C:\clips\a.mp4");
+        let second = Path::new(r"C:\clips\b.mp4");
+        let kept = Path::new(r"C:\clips\c.mp4");
+        store.record(first, sample_record(base));
+        store.record(second, sample_record(&format!("{base}/")));
+        store.record(kept, sample_record(other));
+
+        // A trailing slash in either the argument or the stored record must not matter.
+        assert_eq!(store.remove_for_base(&format!("{base}/")), 2);
+        assert!(!matches(&store, first, base));
+        assert!(!matches(&store, second, base));
+        assert!(matches(&store, kept, other));
+
+        let reloaded = ShareStore::load(path);
+        assert!(!matches(&reloaded, first, base));
+        assert!(!matches(&reloaded, second, base));
+        assert!(matches(&reloaded, kept, other));
+
+        assert_eq!(store.remove_for_base(base), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
