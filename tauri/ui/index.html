@@ -28,6 +28,7 @@
         </button>
       </nav>
       <div class="titlebar-actions">
+        <button id="btn-titlebar-update" class="update-pill is-hidden" type="button" title="Download and restart into the new version">Update available</button>
         <div class="window-controls">
           <button id="win-min" class="win-btn" type="button" title="Minimize" aria-label="Minimize">
             <svg viewBox="0 0 12 12" fill="none" aria-hidden="true">
@@ -285,6 +286,16 @@
 
           <div class="section-spacer"></div>
 
+          <!-- Updates: current version, last check result, and the primary update action -->
+          <div class="glass-card pill-row">
+            <div class="pill-label" title="clip checks GitHub for new versions a few seconds after launch and every 6 hours">Updates</div>
+            <div class="pill-control update-control">
+              <span id="txt-update-version" class="update-version" title="Installed version">v0.1.0</span>
+              <span id="txt-update-status" class="hint-text">Not checked yet</span>
+              <button id="btn-check-updates" class="btn btn-secondary btn-sm" type="button">Check for updates</button>
+            </div>
+          </div>
+
           <!-- Data and logs -->
           <div class="glass-card pill-row">
             <div class="pill-label" title="config.json, clip.log and the clip cache, next to the exe">Data and logs</div>
@@ -514,6 +525,39 @@
       <div class="modal-footer">
         <button id="btn-r2-revoke-cancel" class="btn btn-secondary" type="button">Cancel</button>
         <button id="btn-r2-revoke-confirm" class="btn btn-danger-solid" type="button">Revoke</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- First-run install wizard -->
+  <div id="modal-install-wizard" class="modal-scrim is-hidden" role="dialog" aria-modal="true" aria-labelledby="modal-install-title">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div id="modal-install-title" class="modal-title">Install clip</div>
+          <div class="modal-subtitle">Choose where to install clip. Everything needed stays in this folder.</div>
+        </div>
+      </div>
+      <div class="modal-body">
+        <label class="modal-label" for="inp-install-dir">Install folder</label>
+        <div class="install-dir-row">
+          <input id="inp-install-dir" class="text-input" type="text" autocomplete="off" spellcheck="false" />
+          <button id="btn-install-browse" class="btn btn-secondary btn-xs" type="button">Change</button>
+        </div>
+        <div id="install-hint" class="hint-text install-hint">Defaults to %LocalAppData%\Programs\clip (standard per-user folder, no admin needed).</div>
+        <label class="modal-check">
+          <input id="chk-install-shortcut" type="checkbox" checked />
+          Add Start Menu shortcut
+        </label>
+        <label class="modal-check">
+          <input id="chk-install-autostart" type="checkbox" />
+          Start with Windows
+        </label>
+        <div id="install-error" class="danger-note is-hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-install-exit" class="btn btn-secondary" type="button">Exit</button>
+        <button id="btn-install-confirm" class="btn btn-primary" type="button">Install</button>
       </div>
     </div>
   </div>

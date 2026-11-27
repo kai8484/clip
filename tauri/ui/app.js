@@ -14,6 +14,10 @@
   let activeFitHeight = null;
   let heightVerifyToken = 0;
   let wasMaximized = false;
+  let setupState = null;
+  let installing = false;
+  let updateStatus = null;
+  let updateBusy = false;
 
   let activeTab = 'clips';
   let clips = [];
@@ -73,7 +77,7 @@
     el.style.setProperty('--pct', `${pct}%`);
   }
 
-  function showToast(kind, title, message) {
+  function showToast(kind, title, message, options) {
     const area = $('toast-area');
     const card = document.createElement('div');
     card.className = `toast is-${kind || 'info'}`;
@@ -88,11 +92,29 @@
 
     card.appendChild(t);
     if (message) card.appendChild(m);
+
+    // An actionable toast is a button: the area stays click-through, only the card is live.
+    if (options && typeof options.onClick === 'function') {
+      card.classList.add('is-actionable');
+      card.setAttribute('role', 'button');
+      card.tabIndex = 0;
+      card.addEventListener('click', () => {
+        card.remove();
+        options.onClick();
+      });
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          card.click();
+        }
+      });
+    }
+
     area.appendChild(card);
 
     setTimeout(() => {
       card.remove();
-    }, 3600);
+    }, (options && options.timeoutMs) || 3600);
   }
 
   function measureTargetWindowHeight() {
@@ -113,6 +135,14 @@
     const chromeH = titlebar.getBoundingClientRect().height + toolbarH + statusBar.getBoundingClientRect().height;
 
     const raw = Math.ceil(chromeH + borderY + padY + pageH);
+    // The first-run wizard is a fixed overlay: make sure its card is never vertically clipped.
+    const wizard = $('modal-install-wizard');
+    if (wizard && !wizard.classList.contains('is-hidden')) {
+      const card = wizard.querySelector('.modal-card');
+      if (card) {
+        return Math.max(raw, Math.ceil(card.getBoundingClientRect().height + 64));
+      }
+    }
     if (activePage.id === 'page-clips') {
       return Math.min(Math.max(raw, 280), 621);
     }
@@ -123,7 +153,7 @@
     if (!uiReady) return;
     // Until the first list_clips resolves the Clips page is still empty, so fitting it would
     // shrink the window to the empty-state height right before the gallery arrives.
-    if (activeTab === 'clips' && !clipsLoadedOnce) return;
+    if (activeTab === 'clips' && !clipsLoadedOnce && !installWizardOpen()) return;
     const targetHeight = measureTargetWindowHeight();
     if (!targetHeight) return;
     if (Math.abs(window.innerHeight - targetHeight) <= 1) return;
@@ -1892,11 +1922,268 @@
     } catch (_) {}
   }
 
+  function installWizardOpen() {
+    return !$('modal-install-wizard').classList.contains('is-hidden');
+  }
+
+  function setInstallError(message) {
+    const el = $('install-error');
+    el.textContent = message || '';
+    el.classList.toggle('is-hidden', !message);
+    syncWindowHeight(false);
+  }
+
+  function setInstallBusy(busy) {
+    installing = busy;
+    $('btn-install-confirm').disabled = busy;
+    $('btn-install-confirm').textContent = busy ? 'Installing…' : 'Install';
+    $('btn-install-browse').disabled = busy;
+    $('btn-install-exit').disabled = busy;
+    $('inp-install-dir').disabled = busy;
+    $('chk-install-shortcut').disabled = busy;
+    $('chk-install-autostart').disabled = busy;
+  }
+
+  function openInstallWizard(state) {
+    setupState = state || null;
+    $('inp-install-dir').value = (state && state.default_install_dir) || '';
+    $('chk-install-shortcut').checked = true;
+    $('chk-install-autostart').checked = false;
+    setInstallBusy(false);
+    // Nothing is recorded yet, so the background status bar must not claim otherwise.
+    $('status-text').textContent = 'Setup required';
+    $('status-dot').classList.add('is-muted');
+    $('status-toggle-wrap').classList.add('is-hidden');
+    $('status-hotkey-hint').textContent = '';
+    $('status-meta').textContent = '';
+    $('modal-install-wizard').classList.remove('is-hidden');
+    setInstallError('');
+    // The pill must never sit over the wizard.
+    renderUpdateUI();
+    requestAnimationFrame(() => {
+      syncWindowHeight(false);
+      const inp = $('inp-install-dir');
+      inp.focus();
+      inp.select();
+    });
+  }
+
+  function closeInstallWizard() {
+    $('modal-install-wizard').classList.add('is-hidden');
+    renderUpdateUI();
+    syncWindowHeight(true);
+  }
+
+  async function browseInstallFolder() {
+    if (installing) return;
+    const current = $('inp-install-dir').value.trim() || (setupState && setupState.default_install_dir) || '';
+    try {
+      const picked = await invoke('pick_install_folder', { current });
+      if (picked) {
+        $('inp-install-dir').value = picked;
+        setInstallError('');
+      }
+    } catch (e) {
+      setInstallError(String(e));
+    }
+  }
+
+  async function reloadAfterInstall() {
+    try {
+      const [loadedCfg, loadedState, loadedMics, loadedClips] = await Promise.all([
+        invoke('get_config'),
+        invoke('recorder_state'),
+        invoke('list_mics'),
+        invoke('list_clips').catch((e) => {
+          showToast('error', "Couldn't load clips", String(e));
+          return null;
+        }),
+      ]);
+      cfg = loadedCfg;
+      recState = loadedState;
+      mics = loadedMics || [];
+      renderConfig();
+      renderState();
+      invoke('get_update_status')
+        .then((status) => {
+          if (status) updateStatus = status;
+          renderUpdateUI();
+        })
+        .catch(() => {});
+      clips = Array.isArray(loadedClips) ? loadedClips : [];
+      clipsLoadedOnce = true;
+      clipsLoadedDir = cfg ? cfg.output_dir : null;
+      renderClipsGallery();
+    } catch (e) {
+      showToast('error', 'Initialization error', String(e));
+    }
+    await syncWindowHeight(true);
+    verifyClipsWindowHeight();
+  }
+
+  async function submitInstall() {
+    if (installing) return;
+    const installDir = $('inp-install-dir').value.trim();
+    if (!installDir) {
+      setInstallError('Choose a folder to install clip.');
+      return;
+    }
+    setInstallError('');
+    setInstallBusy(true);
+    try {
+      const res = await invoke('install_app', {
+        installDir,
+        createShortcut: $('chk-install-shortcut').checked,
+        startWithWindows: $('chk-install-autostart').checked,
+      });
+      if (!res || res.relaunched !== false) {
+        // The installed copy is starting and this process exits; keep the wizard in its busy state.
+        return;
+      }
+      $('inp-install-dir').value = res.install_dir || installDir;
+      setupState = setupState ? { ...setupState, needs_setup: false } : setupState;
+      closeInstallWizard();
+      await reloadAfterInstall();
+    } catch (e) {
+      setInstallBusy(false);
+      setInstallError(String(e));
+    }
+  }
+
+  // ---- Updates ---------------------------------------------------------------------------
+
+  function updatePhase() {
+    return (updateStatus && updateStatus.phase) || 'idle';
+  }
+
+  function updateStatusText() {
+    const s = updateStatus || {};
+    switch (s.phase) {
+      case 'checking':
+        return 'Checking…';
+      case 'up_to_date':
+        return 'Up to date';
+      case 'available':
+        return s.latest_version ? `v${s.latest_version} available` : 'Update available';
+      case 'downloading':
+        return 'Downloading…';
+      case 'ready':
+        return 'Restarting…';
+      case 'error':
+        return s.error || "Couldn't check for updates";
+      default:
+        return 'Not checked yet';
+    }
+  }
+
+  // Setup must stay untouched: no update chrome while the install wizard owns the window.
+  function updatesSuppressed() {
+    return installWizardOpen() || Boolean(setupState && setupState.needs_setup);
+  }
+
+  function renderUpdateUI() {
+    const versionEl = $('txt-update-version');
+    const statusEl = $('txt-update-status');
+    const btn = $('btn-check-updates');
+    const pill = $('btn-titlebar-update');
+    if (!versionEl || !statusEl || !btn || !pill) return;
+
+    const phase = updatePhase();
+    const s = updateStatus || {};
+    const working = phase === 'checking' || phase === 'downloading' || phase === 'ready';
+    const canApply = phase === 'available';
+
+    versionEl.textContent = `v${s.current_version || ''}`;
+    statusEl.textContent = updateStatusText();
+    statusEl.classList.toggle('is-error', phase === 'error');
+    statusEl.title = statusEl.textContent;
+
+    if (canApply) {
+      btn.textContent = 'Update available';
+    } else if (phase === 'checking') {
+      btn.textContent = 'Checking…';
+    } else if (phase === 'downloading') {
+      btn.textContent = 'Downloading…';
+    } else if (phase === 'ready') {
+      btn.textContent = 'Restarting…';
+    } else {
+      btn.textContent = 'Check for updates';
+    }
+    btn.classList.toggle('btn-primary', canApply);
+    btn.classList.toggle('btn-secondary', !canApply);
+    btn.disabled = working || updateBusy || updatesSuppressed();
+
+    const showPill =
+      !updatesSuppressed() && (canApply || phase === 'downloading' || phase === 'ready');
+    pill.classList.toggle('is-hidden', !showPill);
+    pill.disabled = !canApply;
+    if (phase === 'downloading') {
+      pill.textContent = 'Downloading…';
+    } else if (phase === 'ready') {
+      pill.textContent = 'Restarting…';
+    } else {
+      pill.textContent = 'Update available';
+    }
+  }
+
+  async function startUpdateDownload() {
+    if (updateBusy || updatePhase() !== 'available') return;
+    updateBusy = true;
+    updateStatus = { ...(updateStatus || {}), phase: 'downloading', error: null };
+    renderUpdateUI();
+    try {
+      updateStatus = await invoke('apply_update');
+      renderUpdateUI();
+    } catch (e) {
+      updateBusy = false;
+      updateStatus = { ...(updateStatus || {}), phase: 'error', error: String(e) };
+      renderUpdateUI();
+      showToast('error', "Couldn't install the update", String(e));
+    }
+  }
+
+  async function checkForUpdatesNow() {
+    if (updateBusy) return;
+    const phase = updatePhase();
+    if (phase === 'available') {
+      startUpdateDownload();
+      return;
+    }
+    if (phase === 'checking' || phase === 'downloading' || phase === 'ready') return;
+    updateBusy = true;
+    updateStatus = { ...(updateStatus || {}), phase: 'checking', error: null };
+    renderUpdateUI();
+    try {
+      updateStatus = await invoke('check_for_updates');
+    } catch (e) {
+      updateStatus = { ...(updateStatus || {}), phase: 'error', error: String(e) };
+    } finally {
+      updateBusy = false;
+      renderUpdateUI();
+    }
+  }
+
+  function showUpdateAvailableToast(payload) {
+    const version = (payload && payload.version) || '';
+    if (updatesSuppressed()) return;
+    showToast(
+      'info',
+      version ? `Update available (v${version})` : 'Update available',
+      'Click to download and restart',
+      { onClick: startUpdateDownload, timeoutMs: 12000 },
+    );
+  }
+
   function bindEvents() {
     // Window controls (titlebar drag handled by data-tauri-drag-region)
     $('win-min').addEventListener('click', () => appWindow.minimize());
     if ($('win-max')) $('win-max').addEventListener('click', () => appWindow.toggleMaximize());
     $('win-close').addEventListener('click', () => appWindow.close());
+
+    // Updates: the titlebar pill downloads and restarts right away, the Settings button either
+    // checks or (once a version is known) starts the download.
+    $('btn-titlebar-update').addEventListener('click', startUpdateDownload);
+    $('btn-check-updates').addEventListener('click', checkForUpdatesNow);
 
     // Tabs
     $('tab-clips').addEventListener('click', () => switchTab('clips'));
@@ -1975,9 +2262,15 @@
       const quitOpen = !$('modal-quit').classList.contains('is-hidden');
       const purgeOpen = !$('modal-r2-purge').classList.contains('is-hidden');
       const revokeOpen = !$('modal-r2-revoke').classList.contains('is-hidden');
+      const installOpen = installWizardOpen();
       const menuOpen = !$('clip-context-menu').classList.contains('is-hidden');
 
       if (e.key === 'Escape') {
+        // The install wizard has no cancel path: installing or Exit are the only ways out.
+        if (installOpen) {
+          e.preventDefault();
+          return;
+        }
         if (menuOpen) {
           hideContextMenu();
         } else if (renameOpen) {
@@ -1996,7 +2289,7 @@
         return;
       }
 
-      if (renameOpen || deleteOpen || quitOpen || purgeOpen || revokeOpen) return;
+      if (renameOpen || deleteOpen || quitOpen || purgeOpen || revokeOpen || installOpen) return;
       const tag = (document.activeElement && document.activeElement.tagName) || '';
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
 
@@ -2307,8 +2600,21 @@
       await invoke('quit_app');
     });
 
+    // First-run install wizard
+    $('btn-install-browse').addEventListener('click', browseInstallFolder);
+    $('btn-install-exit').addEventListener('click', () => invoke('quit_app'));
+    $('btn-install-confirm').addEventListener('click', submitInstall);
+    $('inp-install-dir').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitInstall();
+      }
+    });
+
     // Refresh clip count (and clips gallery when open) on focus
     window.addEventListener('focus', async () => {
+      // Closing the folder picker returns focus mid-wizard; refreshing there fights the modal.
+      if (installWizardOpen()) return;
       try {
         recState = await invoke('recorder_state');
         renderState();
@@ -2360,6 +2666,15 @@
       });
     });
 
+    await listen('update-status', (event) => {
+      updateStatus = event.payload;
+      renderUpdateUI();
+    });
+
+    await listen('update-available', (event) => {
+      showUpdateAvailableToast(event.payload);
+    });
+
     await listen('recorder-event', (event) => {
       const p = event.payload || {};
       showToast(p.kind || 'info', p.title || 'clip', p.message || '');
@@ -2375,6 +2690,17 @@
         syncWindowHeight(true);
       }
     });
+
+    // First run (no data\\config.json next to clip.exe): the install wizard takes over the whole
+    // window; nothing is loaded, recorded or written until the user installs.
+    try {
+      const setup = await invoke('get_setup_state');
+      if (setup && setup.needs_setup) {
+        uiReady = true;
+        openInstallWizard(setup);
+        return;
+      }
+    } catch (_) {}
 
     let clipsError = null;
     try {
@@ -2395,6 +2721,12 @@
 
       renderConfig();
       renderState();
+      invoke('get_update_status')
+        .then((status) => {
+          if (status) updateStatus = status;
+          renderUpdateUI();
+        })
+        .catch(() => {});
 
       // Clips is the start tab, so its gallery is populated before the first height fit.
       clips = Array.isArray(loadedClips) ? loadedClips : [];

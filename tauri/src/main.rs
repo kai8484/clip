@@ -13,7 +13,8 @@ use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
+    WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -36,11 +37,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use clip::app::autostart;
+use clip::app::install;
 use clip::app::keys::{self, hotkey_name};
 use clip::app::mode::{Window, TRAY_MUTEX};
+use clip::app::update;
 use clip::config::{self, CaptureMode, Config, GlobalAction, VideoCodec};
 use clip::library;
-use clip::log::{app_dir, log};
+use clip::log::{app_dir, exe_dir, log};
 use clip::mf::Mf;
 use clip::record::audio;
 use clip::record::recorder::{Event, Notify, Recorder};
@@ -192,6 +195,19 @@ impl FrontendConfig {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct InstallResponse {
+    relaunched: bool,
+    install_dir: String,
+}
+
+#[derive(Clone, Serialize)]
+struct SetupState {
+    needs_setup: bool,
+    default_install_dir: String,
+    current_exe_dir: String,
+}
+
 struct CoreState {
     cfg: Config,
     running: bool,
@@ -217,6 +233,41 @@ struct CoreState {
     menu_save: Option<MenuItem<tauri::Wry>>,
     ev_tx: mpsc::Sender<Event>,
     height_anim_id: u64,
+    /// First run: no `data\config.json` yet, so nothing may be written before the user installs.
+    needs_setup: bool,
+    /// Raw `Local\clip.Main` mutex handle, released before handing off to the installed copy.
+    instance_mutex: Option<usize>,
+    /// In-app update checking: status, HTTP validators and the background checker's wake signal.
+    updates: UpdateManagerState,
+}
+
+/// Update state shared by the background checker, the commands and the webview.
+struct UpdateManagerState {
+    /// Latest status shown in Settings and on the titlebar pill.
+    status: update::UpdateStatus,
+    /// HTTP validator from the last release check, so polling stays a cheap `304`.
+    etag: Option<String>,
+    /// Release tag already announced, so one version never toasts twice.
+    notified_tag: Option<String>,
+    /// Verified release waiting for `apply_update`.
+    info: Option<update::UpdateInfo>,
+    /// A check or download is in flight; a second one is never started.
+    busy: bool,
+    /// `(stopped, wake)`: the checker waits out the interval, but shutdown wakes it at once.
+    shutdown: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl UpdateManagerState {
+    fn new() -> Self {
+        Self {
+            status: update::UpdateStatus::default(),
+            etag: None,
+            notified_tag: None,
+            info: None,
+            busy: false,
+            shutdown: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1178,6 +1229,9 @@ fn shutdown_app(shared: &AppShared, app: &AppHandle) {
         st.running = false;
         (st.rec.take(), st.hotkey_tid, st.capture_cancel.take())
     };
+    // Wakes the background update checker immediately instead of letting it sleep out the
+    // six-hour interval.
+    signal_update_shutdown(shared);
     if let Some(c) = cancel_flag {
         c.store(true, Ordering::Relaxed);
     }
@@ -1187,6 +1241,7 @@ fn shutdown_app(shared: &AppShared, app: &AppHandle) {
         }
     }
     drop(old_rec);
+    release_instance_mutex(shared);
     app.exit(0);
 }
 
@@ -1643,6 +1698,9 @@ fn pause_resume(app: AppHandle, state: State<'_, AppShared>) -> Result<RecorderS
 
 #[tauri::command]
 fn open_folder(state: State<'_, AppShared>, target: Option<String>) {
+    if state.0.lock().unwrap().needs_setup {
+        return;
+    }
     if target.as_deref() == Some("data") {
         open_explorer(&app_dir());
     } else {
@@ -2284,6 +2342,426 @@ fn quit_app(app: AppHandle, state: State<'_, AppShared>) {
     shutdown_app(&state, &app);
 }
 
+fn is_setup_pending(shared: &AppShared) -> bool {
+    shared.0.lock().unwrap().needs_setup
+}
+
+#[tauri::command]
+fn get_setup_state(state: State<'_, AppShared>) -> SetupState {
+    SetupState {
+        needs_setup: state.0.lock().unwrap().needs_setup,
+        default_install_dir: install::default_install_dir().display().to_string(),
+        current_exe_dir: exe_dir().display().to_string(),
+    }
+}
+
+#[tauri::command]
+async fn pick_install_folder(current: Option<String>) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dlg = rfd::FileDialog::new().set_title("Install clip in\u{2026}");
+        if let Some(dir) = current
+            .as_deref()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.is_dir())
+        {
+            dlg = dlg.set_directory(dir);
+        }
+        dlg.pick_folder().map(|p| install::normalize_install_dir(&p).display().to_string())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Closes the single-instance mutex so the installed copy can acquire it during handoff.
+fn release_instance_mutex(shared: &AppShared) {
+    let raw = shared.0.lock().unwrap().instance_mutex.take();
+    if let Some(raw) = raw {
+        unsafe {
+            let _ = CloseHandle(HANDLE(raw as *mut std::ffi::c_void));
+        }
+    }
+}
+
+#[tauri::command]
+async fn install_app(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+    install_dir: String,
+    create_shortcut: bool,
+    start_with_windows: bool,
+) -> Result<InstallResponse, String> {
+    let shared = state.inner().clone();
+    let current_exe = std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
+    let target = PathBuf::from(install_dir.trim());
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        install::install_into(&current_exe, &target, create_shortcut, start_with_windows)
+    })
+    .await
+    .map_err(|e| format!("Install task failed: {e}"))??;
+
+    let install_dir = outcome.installed_dir.display().to_string();
+
+    if outcome.in_place {
+        let cfg = outcome.config.clone();
+        {
+            let mut st = shared.0.lock().unwrap();
+            st.needs_setup = false;
+            st.cfg = cfg.clone();
+            st.running = cfg.enabled;
+            st.clips_count = count_clips(&outcome.clips_dir);
+            st.autostart = autostart::enabled();
+            // The wizard ran with recording controls disabled; turn them back on.
+            if let Some(item) = &st.menu_save {
+                let _ = item.set_enabled(true);
+            }
+            if let Some(item) = &st.menu_toggle {
+                let _ = item.set_enabled(true);
+            }
+            if let Some(item) = &st.menu_mic {
+                let _ = item.set_enabled(true);
+            }
+            sync_tray_locked(&st);
+        }
+        let tid = spawn_hotkey_thread(shared.clone(), app.clone());
+        shared.0.lock().unwrap().hotkey_tid = tid;
+        if cfg.enabled {
+            let notify_tx = shared.0.lock().unwrap().ev_tx.clone();
+            let rec = Recorder::start(cfg.clone(), make_notify(notify_tx));
+            shared.0.lock().unwrap().rec = Some(rec);
+        }
+        log("clip (Tauri) installed & started");
+        emit_config_and_state(&app, &shared);
+        // The setup path skipped the updater (nothing was installed yet); start it now.
+        spawn_update_checker(app.clone(), shared.clone());
+        let key = hotkey_name(cfg.hotkey_vk, cfg.hotkey_mods);
+        emit_toast(
+            &app,
+            "info",
+            "clip installed",
+            &format!("Ready in {install_dir}. Press {key} to save a clip."),
+        );
+        return Ok(InstallResponse { relaunched: false, install_dir });
+    }
+
+    // Launch the installed copy first: it retries the instance mutex for a moment, so this copy
+    // can release it right after and exit without a handoff race.
+    std::process::Command::new(&outcome.installed_exe)
+        .arg("--installed")
+        .current_dir(&outcome.installed_dir)
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "clip was installed, but launching {} failed: {e}",
+                outcome.installed_exe.display()
+            )
+        })?;
+    release_instance_mutex(&shared);
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        let exit_handle = handle.clone();
+        let _ = handle.run_on_main_thread(move || exit_handle.exit(0));
+    });
+    Ok(InstallResponse { relaunched: true, install_dir })
+}
+
+/// Tells the background update checker to stop waiting and exit its thread.
+fn signal_update_shutdown(shared: &AppShared) {
+    let shutdown = shared.0.lock().unwrap().updates.shutdown.clone();
+    let (lock, wake) = &*shutdown;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+}
+
+/// Waits up to `timeout` for shutdown. `true` means clip is exiting.
+fn wait_for_update_shutdown(shutdown: &Arc<(Mutex<bool>, Condvar)>, timeout: Duration) -> bool {
+    let (lock, wake) = &**shutdown;
+    let guard = lock.lock().unwrap();
+    match wake.wait_timeout(guard, timeout) {
+        Ok((guard, _)) => *guard,
+        // A panicked checker must not keep this thread alive.
+        Err(_) => true,
+    }
+}
+
+fn emit_update_status(app: &AppHandle, shared: &AppShared) {
+    let status = shared.0.lock().unwrap().updates.status.clone();
+    let _ = app.emit("update-status", status);
+}
+
+/// Runs one release check. The network call happens with no lock held, and the result (including
+/// a first-time "new version" notification) is stored and emitted before returning.
+///
+/// Background checks stay silent on `404`, `401`/`403` and offline failures: a private repository
+/// or a missing network is not a problem the user needs to see every six hours.
+fn perform_update_check(app: &AppHandle, shared: &AppShared, manual: bool) -> update::UpdateStatus {
+    let (etag, current_version) = {
+        let mut st = shared.0.lock().unwrap();
+        if st.needs_setup || st.updates.busy {
+            return st.updates.status.clone();
+        }
+        st.updates.busy = true;
+        if manual {
+            st.updates.status.phase = update::UpdatePhase::Checking;
+            st.updates.status.error = None;
+        }
+        (st.updates.etag.clone(), st.updates.status.current_version.clone())
+    };
+    if manual {
+        emit_update_status(app, shared);
+    }
+
+    let result = update::check_for_update(
+        update::RELEASES_LATEST_URL,
+        &current_version,
+        etag.as_deref(),
+        false,
+    );
+
+    let (status, newly_available) = {
+        let mut st = shared.0.lock().unwrap();
+        let manager = &mut st.updates;
+        manager.busy = false;
+        let mut newly_available = None;
+        match result {
+            Ok(outcome) => {
+                manager.etag = outcome.etag;
+                match outcome.status {
+                    update::CheckStatus::NotModified => {
+                        if manager.info.is_some() {
+                            // A 304 means the release we already found is still current; keep
+                            // offering it instead of downgrading the status to UpToDate.
+                            manager.status.phase = update::UpdatePhase::Available;
+                            manager.status.error = None;
+                        } else if manual {
+                            manager.status.phase = update::UpdatePhase::UpToDate;
+                            manager.status.error = None;
+                        }
+                    }
+                    update::CheckStatus::UpToDate { latest } => {
+                        manager.info = None;
+                        manager.status.phase = update::UpdatePhase::UpToDate;
+                        manager.status.latest_version = Some(latest);
+                        manager.status.notes_url = None;
+                        manager.status.error = None;
+                    }
+                    update::CheckStatus::Available(info) => {
+                        manager.status.phase = update::UpdatePhase::Available;
+                        manager.status.latest_version = Some(info.version.clone());
+                        manager.status.notes_url = Some(info.notes_url.clone());
+                        manager.status.error = None;
+                        if manager.notified_tag.as_deref() != Some(info.tag.as_str()) {
+                            manager.notified_tag = Some(info.tag.clone());
+                            newly_available = Some(info.clone());
+                        }
+                        manager.info = Some(info);
+                    }
+                    update::CheckStatus::NotPublished => {
+                        if manual {
+                            manager.status.phase = update::UpdatePhase::Error;
+                            manager.status.error =
+                                Some("No clip release is published yet.".into());
+                        }
+                    }
+                    update::CheckStatus::Restricted => {
+                        if manual {
+                            manager.status.phase = update::UpdatePhase::Error;
+                            manager.status.error = Some(
+                                "GitHub did not allow the update check (the repository may be private)."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if manual {
+                    manager.status.phase = update::UpdatePhase::Error;
+                    manager.status.error = Some(e);
+                }
+            }
+        }
+        (manager.status.clone(), newly_available)
+    };
+
+    let _ = app.emit("update-status", status.clone());
+    if let Some(info) = newly_available {
+        let _ = app.emit("update-available", update::UpdateAvailableEvent::from(&info));
+    }
+    status
+}
+
+/// Downloads, verifies and installs the pending update. Blocking: call it off the UI thread.
+fn apply_update_blocking(
+    app: &AppHandle,
+    shared: &AppShared,
+) -> Result<update::UpdateStatus, String> {
+    let info = {
+        let mut st = shared.0.lock().unwrap();
+        if st.needs_setup {
+            return Err("Finish setting up clip first.".into());
+        }
+        if st.updates.busy {
+            return Err("An update is already in progress.".into());
+        }
+        let Some(info) = st.updates.info.clone() else {
+            return Err("No update is available yet.".into());
+        };
+        st.updates.busy = true;
+        st.updates.status.phase = update::UpdatePhase::Downloading;
+        st.updates.status.error = None;
+        info
+    };
+    emit_update_status(app, shared);
+
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
+    let outcome = update::download_and_apply_update(&current_exe, &info, false);
+
+    let status = {
+        let mut st = shared.0.lock().unwrap();
+        let manager = &mut st.updates;
+        manager.busy = false;
+        match &outcome {
+            Ok(version) => {
+                manager.status.phase = update::UpdatePhase::Ready;
+                manager.status.latest_version = Some(version.clone());
+                manager.status.error = None;
+            }
+            Err(e) => {
+                manager.status.phase = update::UpdatePhase::Error;
+                manager.status.error = Some(e.clone());
+            }
+        }
+        manager.status.clone()
+    };
+    let _ = app.emit("update-status", status.clone());
+    match outcome {
+        Ok(_) => Ok(status),
+        Err(e) => Err(e),
+    }
+}
+
+/// Checks shortly after launch and then every [`update::CHECK_INTERVAL`], waking at once on
+/// shutdown.
+fn spawn_update_checker(app: AppHandle, shared: AppShared) {
+    let shutdown = shared.0.lock().unwrap().updates.shutdown.clone();
+    let _ = std::thread::Builder::new()
+        .name("clip-update-check".into())
+        .spawn(move || {
+            if wait_for_update_shutdown(&shutdown, update::STARTUP_CHECK_DELAY) {
+                return;
+            }
+            loop {
+                perform_update_check(&app, &shared, false);
+                if wait_for_update_shutdown(&shutdown, update::CHECK_INTERVAL) {
+                    return;
+                }
+            }
+        });
+}
+
+#[tauri::command]
+fn get_update_status(state: State<'_, AppShared>) -> update::UpdateStatus {
+    state.0.lock().unwrap().updates.status.clone()
+}
+
+/// Manual "Check for updates": reports a clear status (or error) instead of failing silently.
+#[tauri::command]
+async fn check_for_updates(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+) -> Result<update::UpdateStatus, String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if is_setup_pending(&shared) {
+            return Err("Finish setting up clip first.".to_string());
+        }
+        Ok(perform_update_check(&app, &shared, true))
+    })
+    .await
+    .map_err(|e| format!("Update check failed: {e}"))?
+}
+
+/// Downloads the pending update, verifies it, swaps `clip.exe` and restarts into the new build.
+#[tauri::command]
+async fn apply_update(
+    app: AppHandle,
+    state: State<'_, AppShared>,
+) -> Result<update::UpdateStatus, String> {
+    let shared = state.inner().clone();
+    let status = {
+        let app = app.clone();
+        let shared = shared.clone();
+        tauri::async_runtime::spawn_blocking(move || apply_update_blocking(&app, &shared))
+            .await
+            .map_err(|e| format!("Update failed: {e}"))?
+    }?;
+
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Could not locate clip.exe: {e}"))?;
+    // Launch first: the new copy retries the instance mutex for a moment, so this copy can
+    // release it right after and exit without a handoff race.
+    std::process::Command::new(&current_exe)
+        .arg("--updated")
+        .current_dir(exe_dir())
+        .spawn()
+        .map_err(|e| format!("clip was updated, but restarting it failed: {e}"))?;
+    release_instance_mutex(&shared);
+    // Go through the normal shutdown path so the recorder, capture cancel flag and hotkeys stop
+    // cleanly instead of leaving the old copy recording while the new one starts.
+    let exit_shared = shared.clone();
+    let exit_handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        let call_handle = exit_handle.clone();
+        let _ = exit_handle.run_on_main_thread(move || shutdown_app(&exit_shared, &call_handle));
+    });
+    Ok(status)
+}
+
+fn acquire_instance_mutex() -> Option<HANDLE> {
+    unsafe {
+        let handle = CreateMutexW(None, true, TRAY_MUTEX).ok();
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Some(h) = handle {
+                let _ = CloseHandle(h);
+            }
+            None
+        } else {
+            handle
+        }
+    }
+}
+
+/// Acquires the single-instance mutex. The freshly installed copy retries briefly because the
+/// downloads copy releases the mutex right after spawning it.
+fn acquire_instance_mutex_with_retry(handoff: bool) -> Option<HANDLE> {
+    let attempts = if handoff { 40 } else { 1 };
+    for attempt in 0..attempts {
+        if let Some(handle) = acquire_instance_mutex() {
+            return Some(handle);
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    None
+}
+
+fn focus_running_instance() {
+    if let Some(hwnd) = find_own_window(Window::Settings.title()) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 fn main() {
     #[cfg(feature = "devtools")]
     {
@@ -2292,37 +2770,40 @@ fn main() {
             std::process::exit(code);
         }
     }
-    let _instance_mutex = unsafe { CreateMutexW(None, true, TRAY_MUTEX).ok() };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        if let Some(hwnd) = find_own_window(Window::Settings.title()) {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(hwnd);
-            }
-        }
+    let launched_installed = std::env::args().any(|a| a == "--installed");
+    let launched_updated = std::env::args().any(|a| a == "--updated");
+    // A handoff from the installer or from an in-app update: the previous copy releases the
+    // mutex a moment after spawning this one.
+    let handoff = launched_installed || launched_updated;
+    let Some(instance_mutex) = acquire_instance_mutex_with_retry(handoff) else {
+        focus_running_instance();
         return;
+    };
+    let instance_mutex = instance_mutex.0 as usize;
+
+    // Only this process owns clip.exe now, so leftovers from an interrupted update are stale.
+    if let Ok(current_exe) = std::env::current_exe() {
+        update::cleanup_old_exe(&current_exe);
     }
 
-    autostart::repair();
-    let first_run = !config::exists();
-    let cfg = config::load();
-    if first_run {
-        let _ = config::save(&cfg);
+    // No `data\config.json` next to the executable yet: show the install wizard and write
+    // nothing to disk until the user picks a folder and installs.
+    let needs_setup = !config::exists();
+    if !needs_setup {
+        autostart::repair();
     }
+    let cfg = config::load();
     let background = std::env::args().any(|a| a == "--background");
 
     let (ev_tx, ev_rx) = mpsc::channel();
     let shared = AppShared(Arc::new(Mutex::new(CoreState {
         cfg: cfg.clone(),
-        running: true,
+        running: !needs_setup,
         rec: None,
         error: None,
         game: None,
         encoder: None,
-        clips_count: count_clips(&cfg.output_dir),
+        clips_count: if needs_setup { 0 } else { count_clips(&cfg.output_dir) },
         autostart: autostart::enabled(),
         thumbs: ThumbStore::default(),
         shares: ShareStore::load(app_dir().join("shares.json")),
@@ -2336,11 +2817,15 @@ fn main() {
         menu_save: None,
         ev_tx,
         height_anim_id: 0,
+        needs_setup,
+        instance_mutex: Some(instance_mutex),
+        updates: UpdateManagerState::new(),
     })));
 
     let setup_shared = shared.clone();
     let event_shared = shared.clone();
     let protocol_shared = shared.clone();
+    let window_shared = shared.clone();
 
     let res = tauri::Builder::default()
         .manage(shared)
@@ -2350,7 +2835,12 @@ fn main() {
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if is_setup_pending(&window_shared) {
+                    // No install yet: nothing runs in the tray, so closing must exit cleanly.
+                    shutdown_app(&window_shared, window.app_handle());
+                } else {
+                    let _ = window.hide();
+                }
             }
         })
         .setup(move |app| {
@@ -2398,16 +2888,16 @@ fn main() {
                         );
                     }
                 }
-                if first_run || !background {
+                if needs_setup || !background {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
             }
 
-            let save_clip = MenuItem::with_id(app, "save_clip", "Save clip now", cfg.enabled, None::<&str>)?;
+            let save_clip = MenuItem::with_id(app, "save_clip", "Save clip now", cfg.enabled && !needs_setup, None::<&str>)?;
             let open_fld = MenuItem::with_id(app, "open_folder", "Open clips folder", true, None::<&str>)?;
-            let toggle_rec = CheckMenuItem::with_id(app, "toggle_rec", "Recording", true, cfg.enabled, None::<&str>)?;
-            let toggle_mic = CheckMenuItem::with_id(app, "toggle_mic", "Microphone", true, cfg.mic_audio, None::<&str>)?;
+            let toggle_rec = CheckMenuItem::with_id(app, "toggle_rec", "Recording", !needs_setup, cfg.enabled, None::<&str>)?;
+            let toggle_mic = CheckMenuItem::with_id(app, "toggle_mic", "Microphone", !needs_setup, cfg.mic_audio, None::<&str>)?;
             let open_win = MenuItem::with_id(app, "open_window", "Open clip", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
 
@@ -2425,20 +2915,27 @@ fn main() {
             let tray_shared = setup_shared.clone();
             let tray = TrayIconBuilder::with_id("main-tray")
                 .icon(tray_status_icon())
-                .tooltip(tray_tooltip(&cfg, true, None, None))
+                .tooltip(tray_tooltip(&cfg, !needs_setup, None, None))
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "open_window" => show_main_window(app),
                     "save_clip" => trigger_save(&tray_shared),
                     "open_folder" => {
-                        let dir = tray_shared.0.lock().unwrap().cfg.output_dir.clone();
-                        open_explorer(&dir);
+                        if !is_setup_pending(&tray_shared) {
+                            let dir = tray_shared.0.lock().unwrap().cfg.output_dir.clone();
+                            open_explorer(&dir);
+                        }
                     }
                     "toggle_rec" => {
-                        perform_toggle_recording(&tray_shared, app, false);
+                        if !is_setup_pending(&tray_shared) {
+                            perform_toggle_recording(&tray_shared, app, false);
+                        }
                     }
                     "toggle_mic" => {
+                        if is_setup_pending(&tray_shared) {
+                            return;
+                        }
                         let mut c = tray_shared.0.lock().unwrap().cfg.clone();
                         c.mic_audio = !c.mic_audio;
                         c.sanitize();
@@ -2470,36 +2967,45 @@ fn main() {
 
             spawn_event_thread(setup_shared.clone(), handle.clone(), ev_rx);
 
-            let tid = spawn_hotkey_thread(setup_shared.clone(), handle.clone());
-            {
-                let mut st = setup_shared.0.lock().unwrap();
-                st.hotkey_tid = tid;
+            // First run: nothing is recorded, logged or pruned until the wizard installs clip into
+            // the chosen folder (the UI shows `#modal-install-wizard` instead).
+            if !needs_setup {
+                let tid = spawn_hotkey_thread(setup_shared.clone(), handle.clone());
+                {
+                    let mut st = setup_shared.0.lock().unwrap();
+                    st.hotkey_tid = tid;
+                }
+
+                if cfg.enabled {
+                    let notify_tx = setup_shared.0.lock().unwrap().ev_tx.clone();
+                    let rec = Recorder::start(cfg.clone(), make_notify(notify_tx));
+                    setup_shared.0.lock().unwrap().rec = Some(rec);
+                }
             }
 
-            if cfg.enabled {
-                let notify_tx = setup_shared.0.lock().unwrap().ev_tx.clone();
-                let rec = Recorder::start(cfg.clone(), make_notify(notify_tx));
-                setup_shared.0.lock().unwrap().rec = Some(rec);
-            }
-
-            if first_run {
+            if launched_installed && !needs_setup {
                 let key = hotkey_name(cfg.hotkey_vk, cfg.hotkey_mods);
-                let secs = fmt_secs(cfg.seconds);
-                let (title, message) = if cfg.capture_mode == CaptureMode::GamesOnly {
-                    (
-                        "clip is ready",
-                        format!("Records automatically while playing. Press {key} to save the last {secs}."),
-                    )
-                } else {
-                    (
-                        "clip is recording",
-                        format!("Press {key} to save the last {secs}. clip stays in the tray."),
-                    )
-                };
-                emit_toast(&handle, "info", title, &message);
+                emit_toast(
+                    &handle,
+                    "info",
+                    "clip installed",
+                    &format!("Ready in {}. Press {key} to save a clip.", exe_dir().display()),
+                );
             }
-            std::thread::spawn(prune_thumb_cache);
-            log("clip (Tauri) started");
+            if launched_updated && !needs_setup {
+                emit_toast(
+                    &handle,
+                    "info",
+                    "clip updated",
+                    &format!("Now running v{}.", env!("CARGO_PKG_VERSION")),
+                );
+            }
+            if !needs_setup {
+                std::thread::spawn(prune_thumb_cache);
+                // First check ~15 s after launch, then every 6 hours until shutdown.
+                spawn_update_checker(handle.clone(), setup_shared.clone());
+                log("clip (Tauri) started");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2535,6 +3041,12 @@ fn main() {
             cancel_hotkey_capture,
             fit_window_height,
             quit_app,
+            get_setup_state,
+            pick_install_folder,
+            install_app,
+            get_update_status,
+            check_for_updates,
+            apply_update,
         ])
         .run(tauri::generate_context!());
 

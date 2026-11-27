@@ -104,6 +104,50 @@ html, body {
   gap: 8px;
 }
 
+/* Titlebar update pill: only rendered while a verified newer version is waiting. */
+.update-pill {
+  height: 24px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.update-pill:hover {
+  background: var(--accent-hover);
+}
+
+.update-pill:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
+/* Settings > Updates row */
+.update-control {
+  gap: 10px;
+}
+
+.update-control .hint-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.update-control .hint-text.is-error {
+  color: var(--danger);
+}
+
+.update-version {
+  font-size: var(--fs-md);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 .window-controls {
   display: flex;
   align-items: center;
@@ -817,6 +861,22 @@ html, body {
   font-size: var(--fs-sm);
 }
 
+/* Actionable toasts (e.g. "Update available") must accept clicks: .toast-area ignores them. */
+.toast.is-actionable {
+  pointer-events: auto;
+  cursor: pointer;
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.toast.is-actionable:hover {
+  background: #222224;
+}
+
+.toast.is-actionable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .toast.is-warn,
 .toast.is-error {
   border-color: var(--danger-hover);
@@ -908,6 +968,47 @@ html, body {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* First-run install wizard */
+.modal-label {
+  display: block;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.install-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.install-dir-row .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.install-hint {
+  margin-top: 7px;
+  white-space: normal;
+  line-height: 1.4;
+}
+
+#modal-install-wizard .modal-check {
+  margin-top: 14px;
+}
+
+#modal-install-wizard .modal-check input {
+  accent-color: var(--text);
+}
+
+#modal-install-wizard .modal-check + .modal-check {
+  margin-top: 8px;
+}
+
+#install-error {
+  margin-top: 12px;
 }
 
 /* Clips gallery */

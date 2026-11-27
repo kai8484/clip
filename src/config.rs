@@ -240,10 +240,15 @@ pub fn load() -> Config {
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
-    std::fs::create_dir_all(app_dir())?;
-    let tmp = app_dir().join("config.json.tmp");
+    save_to(&app_dir(), cfg)
+}
+
+/// Atomically writes `config.json` into an arbitrary data folder (used by the installer).
+pub fn save_to(dir: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join("config.json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(cfg).unwrap_or_default())?;
-    std::fs::rename(&tmp, config_path())
+    std::fs::rename(&tmp, dir.join("config.json"))
 }
 
 pub fn config_mtime() -> Option<std::time::SystemTime> {

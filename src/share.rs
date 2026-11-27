@@ -402,11 +402,22 @@ fn winhttp_put_file(
     winhttp_request(session, parsed, w!("PUT"), upload_key, path_suffix, headers, body)
 }
 
+/// `clip/<version>` — the crate version, so uploads and update checks never advertise a stale
+/// hardcoded release.
+fn user_agent() -> PCWSTR {
+    static AGENT: std::sync::OnceLock<HSTRING> = std::sync::OnceLock::new();
+    PCWSTR::from_raw(
+        AGENT
+            .get_or_init(|| HSTRING::from(concat!("clip/", env!("CARGO_PKG_VERSION"))))
+            .as_ptr(),
+    )
+}
+
 /// Opens a WinHTTP session with the app's user agent, proxy defaults and timeouts.
 fn open_winhttp_session() -> Result<HttpHandle, String> {
     let session = unsafe {
         HttpHandle(WinHttpOpen(
-            w!("clip/0.3"),
+            user_agent(),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),

@@ -31,11 +31,20 @@ pub fn enabled() -> bool {
 }
 
 pub fn set(on: bool) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    set_for_exe(&exe, on);
+}
+
+/// Adds or removes the startup entry for `exe`, which need not be the running executable
+/// (the installer registers the freshly installed copy).
+pub fn set_for_exe(exe: &Path, on: bool) {
     unsafe {
         if on {
-            let Ok(exe) = std::env::current_exe() else { return };
+            if exe.as_os_str().is_empty() {
+                return;
+            }
             // Start minimized to tray without opening any window on sign-in.
-            let v: Vec<u16> = Mode::Tray { background: true }.command_line(&exe).encode_utf16().chain(std::iter::once(0)).collect();
+            let v: Vec<u16> = Mode::Tray { background: true }.command_line(exe).encode_utf16().chain(std::iter::once(0)).collect();
             let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, NAME, REG_SZ.0, Some(v.as_ptr() as *const _), (v.len() * 2) as u32);
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, NAME);
