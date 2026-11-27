@@ -861,22 +861,6 @@ html, body {
   font-size: var(--fs-sm);
 }
 
-/* Actionable toasts (e.g. "Update available") must accept clicks: .toast-area ignores them. */
-.toast.is-actionable {
-  pointer-events: auto;
-  cursor: pointer;
-  border-color: rgba(255, 255, 255, 0.22);
-}
-
-.toast.is-actionable:hover {
-  background: #222224;
-}
-
-.toast.is-actionable:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
 .toast.is-warn,
 .toast.is-error {
   border-color: var(--danger-hover);

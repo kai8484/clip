@@ -77,7 +77,7 @@
     el.style.setProperty('--pct', `${pct}%`);
   }
 
-  function showToast(kind, title, message, options) {
+  function showToast(kind, title, message) {
     const area = $('toast-area');
     const card = document.createElement('div');
     card.className = `toast is-${kind || 'info'}`;
@@ -93,28 +93,11 @@
     card.appendChild(t);
     if (message) card.appendChild(m);
 
-    // An actionable toast is a button: the area stays click-through, only the card is live.
-    if (options && typeof options.onClick === 'function') {
-      card.classList.add('is-actionable');
-      card.setAttribute('role', 'button');
-      card.tabIndex = 0;
-      card.addEventListener('click', () => {
-        card.remove();
-        options.onClick();
-      });
-      card.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          card.click();
-        }
-      });
-    }
-
     area.appendChild(card);
 
     setTimeout(() => {
       card.remove();
-    }, (options && options.timeoutMs) || 3600);
+    }, 3600);
   }
 
   function measureTargetWindowHeight() {
@@ -2163,17 +2146,6 @@
     }
   }
 
-  function showUpdateAvailableToast(payload) {
-    const version = (payload && payload.version) || '';
-    if (updatesSuppressed()) return;
-    showToast(
-      'info',
-      version ? `Update available (v${version})` : 'Update available',
-      'Click to download and restart',
-      { onClick: startUpdateDownload, timeoutMs: 12000 },
-    );
-  }
-
   function bindEvents() {
     // Window controls (titlebar drag handled by data-tauri-drag-region)
     $('win-min').addEventListener('click', () => appWindow.minimize());
@@ -2669,10 +2641,6 @@
     await listen('update-status', (event) => {
       updateStatus = event.payload;
       renderUpdateUI();
-    });
-
-    await listen('update-available', (event) => {
-      showUpdateAvailableToast(event.payload);
     });
 
     await listen('recorder-event', (event) => {

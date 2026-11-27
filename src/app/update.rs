@@ -922,25 +922,6 @@ impl Default for UpdateStatus {
     }
 }
 
-/// Emitted as `update-available` when a background check finds a version the user has not been
-/// told about yet.
-#[derive(Clone, Debug, Serialize)]
-pub struct UpdateAvailableEvent {
-    pub version: String,
-    pub tag: String,
-    pub notes_url: String,
-}
-
-impl From<&UpdateInfo> for UpdateAvailableEvent {
-    fn from(info: &UpdateInfo) -> Self {
-        Self {
-            version: info.version.clone(),
-            tag: info.tag.clone(),
-            notes_url: info.notes_url.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

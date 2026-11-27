@@ -247,8 +247,6 @@ struct UpdateManagerState {
     status: update::UpdateStatus,
     /// HTTP validator from the last release check, so polling stays a cheap `304`.
     etag: Option<String>,
-    /// Release tag already announced, so one version never toasts twice.
-    notified_tag: Option<String>,
     /// Verified release waiting for `apply_update`.
     info: Option<update::UpdateInfo>,
     /// A check or download is in flight; a second one is never started.
@@ -262,7 +260,6 @@ impl UpdateManagerState {
         Self {
             status: update::UpdateStatus::default(),
             etag: None,
-            notified_tag: None,
             info: None,
             busy: false,
             shutdown: Arc::new((Mutex::new(false), Condvar::new())),
@@ -2490,8 +2487,8 @@ fn emit_update_status(app: &AppHandle, shared: &AppShared) {
     let _ = app.emit("update-status", status);
 }
 
-/// Runs one release check. The network call happens with no lock held, and the result (including
-/// a first-time "new version" notification) is stored and emitted before returning.
+/// Runs one release check. The network call happens with no lock held, and the result is stored
+/// and emitted before returning.
 ///
 /// Background checks stay silent on `404`, `401`/`403` and offline failures: a private repository
 /// or a missing network is not a problem the user needs to see every six hours.
@@ -2519,11 +2516,10 @@ fn perform_update_check(app: &AppHandle, shared: &AppShared, manual: bool) -> up
         false,
     );
 
-    let (status, newly_available) = {
+    let status = {
         let mut st = shared.0.lock().unwrap();
         let manager = &mut st.updates;
         manager.busy = false;
-        let mut newly_available = None;
         match result {
             Ok(outcome) => {
                 manager.etag = outcome.etag;
@@ -2551,10 +2547,6 @@ fn perform_update_check(app: &AppHandle, shared: &AppShared, manual: bool) -> up
                         manager.status.latest_version = Some(info.version.clone());
                         manager.status.notes_url = Some(info.notes_url.clone());
                         manager.status.error = None;
-                        if manager.notified_tag.as_deref() != Some(info.tag.as_str()) {
-                            manager.notified_tag = Some(info.tag.clone());
-                            newly_available = Some(info.clone());
-                        }
                         manager.info = Some(info);
                     }
                     update::CheckStatus::NotPublished => {
@@ -2582,13 +2574,10 @@ fn perform_update_check(app: &AppHandle, shared: &AppShared, manual: bool) -> up
                 }
             }
         }
-        (manager.status.clone(), newly_available)
+        manager.status.clone()
     };
 
     let _ = app.emit("update-status", status.clone());
-    if let Some(info) = newly_available {
-        let _ = app.emit("update-available", update::UpdateAvailableEvent::from(&info));
-    }
     status
 }
 
