@@ -2852,7 +2852,7 @@ fn main() {
 
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_icon(Image::from_bytes(include_bytes!("../../assets/icon/app64.png")).unwrap().to_owned());
-                let _ = win.set_background_color(Some(tauri::window::Color(19, 19, 20, 255)));
+                let _ = win.set_background_color(Some(tauri::window::Color(13, 17, 26, 255)));
                 // Win11 rounded corners without DWM's gray default border.
                 if let Ok(raw_hwnd) = win.hwnd() {
                     let hwnd = HWND(raw_hwnd.0);
@@ -2865,10 +2865,10 @@ fn main() {
                             (&pref as *const u32).cast(),
                             std::mem::size_of::<u32>() as u32,
                         );
-                        // Match Win11 native border color to the neutral dark window chrome
-                        // (#2C2C2C, keyed to the #1B1B1B tile / #131314 background) to prevent
+                        // Match Win11 native border color to the Miku dark-slate window chrome
+                        // (#223B4A, keyed to the #141926 tile / #0D111A background) to prevent
                         // gray DWM artifacts around the rounded top corners.
-                        let border: u32 = 0x002C_2C2C;
+                        let border: u32 = 0x004A_3B22;
                         let _ = DwmSetWindowAttribute(
                             hwnd,
                             DWMWA_BORDER_COLOR,

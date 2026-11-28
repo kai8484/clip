@@ -17,22 +17,28 @@
 }
 
 :root {
-  --bg: #131314;
-  --surface: #1b1b1b;
-  --glass-panel: #1b1b1b;
-  --glass-bar: #1b1b1b;
-  --glass-status: #1b1b1b;
-  --border: rgba(255, 255, 255, 0.08);
-  --control: #262628;
-  --control-hover: #303033;
-  --ghost-hover: #242426;
-  --text: #E3E3E3;
-  --muted: #9AA0A6;
-  --accent: #E3E3E3;
-  --accent-hover: #F5F5F5;
-  --danger: #F28B82;
-  --danger-hover: rgba(242, 139, 130, 0.14);
-  --rail-bg: #2E2E30;
+  --bg: #0D111A;
+  --surface: #141926;
+  --surface-deep: #0A0E16;
+  --glass-panel: var(--surface);
+  --glass-bar: var(--surface);
+  --glass-status: var(--surface);
+  --border: rgba(57, 197, 187, 0.16);
+  --control: #1D2538;
+  --control-hover: #27324A;
+  --ghost-hover: #1B2233;
+  --text: #ECF6FA;
+  --muted: #8FA4B8;
+  /* Miku: signature cyan/blue with magenta-pink secondary accents. */
+  --miku-cyan: #39C5BB;
+  --miku-blue: #38BDF8;
+  --miku-pink: #FF4D9D;
+  --miku-pink-light: #FF7AB8;
+  --accent: #39C5BB;
+  --accent-hover: #5BE3D9;
+  --danger: #FF5C8A;
+  --danger-hover: rgba(255, 92, 138, 0.16);
+  --rail-bg: #232D42;
 
   --fs-head: 17px;
   --fs-title: 15px;
@@ -93,7 +99,7 @@ html, body {
   justify-content: space-between;
   gap: 10px;
   background: var(--glass-bar);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(57, 197, 187, 0.10);
   z-index: 3;
   user-select: none;
 }
@@ -110,17 +116,19 @@ html, body {
   padding: 0 11px;
   border: 0;
   border-radius: 999px;
-  background: var(--accent);
-  color: var(--bg);
+  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  color: #071118;
   font-family: inherit;
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
+  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.38);
 }
 
 .update-pill:hover {
-  background: var(--accent-hover);
+  background: linear-gradient(135deg, #5BE3D9 0%, #5CC8FF 100%);
+  box-shadow: 0 2px 14px rgba(57, 197, 187, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.48);
 }
 
 .update-pill:disabled {
@@ -174,7 +182,7 @@ html, body {
 }
 
 .win-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--ghost-hover);
   color: var(--text);
 }
 
@@ -231,9 +239,10 @@ html, body {
 /* No hover response on selected/active elements */
 .tab-btn.is-active,
 .tab-btn.is-active:hover {
-  background: var(--accent);
-  color: var(--bg);
+  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 52%, #FF5CA8 100%);
+  color: #071118;
   font-weight: 600;
+  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.26);
 }
 
 /* Workspace */
@@ -272,7 +281,7 @@ html, body {
 }
 
 .content-scroll::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(57, 197, 187, 0.22);
   border-radius: 3px;
 }
 
@@ -293,6 +302,7 @@ html, body {
 /* Flat cards */
 .glass-card {
   background: var(--glass-panel);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
 }
 
@@ -464,41 +474,51 @@ html, body {
 }
 
 .btn-primary {
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
+  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  color: #071118;
+  font-weight: 700;
+  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.38);
 }
 
 .btn-primary:hover {
-  background: var(--accent-hover);
+  background: linear-gradient(135deg, #5BE3D9 0%, #5CC8FF 100%);
+  box-shadow: 0 2px 14px rgba(57, 197, 187, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.48);
 }
 
 .btn-secondary {
-  background: var(--control);
+  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
   color: var(--text);
+  border: 1px solid rgba(57, 197, 187, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 .btn-secondary:hover {
-  background: var(--control-hover);
+  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
+  border-color: rgba(57, 197, 187, 0.38);
+  box-shadow: 0 0 10px rgba(57, 197, 187, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 
 .btn-danger {
   background: transparent;
   color: var(--danger);
+  border: 1px solid transparent;
 }
 
 .btn-danger:hover {
   background: var(--danger-hover);
+  border-color: rgba(255, 92, 138, 0.35);
 }
 
 .btn-danger-solid {
-  background: var(--danger);
-  color: var(--bg);
-  font-weight: 600;
+  background: linear-gradient(135deg, #FF4D9D 0%, #FF6B8B 100%);
+  color: #16060F;
+  font-weight: 700;
+  box-shadow: 0 2px 10px rgba(255, 77, 157, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.34);
 }
 
 .btn-danger-solid:hover {
-  background: #F6A59E;
+  background: linear-gradient(135deg, #FF6BB0 0%, #FF8598 100%);
+  box-shadow: 0 2px 14px rgba(255, 77, 157, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.44);
 }
 
 .btn:disabled {
@@ -520,24 +540,28 @@ html, body {
   min-width: 76px;
   height: 30px;
   padding: 0 14px;
-  border: 0;
+  border: 1px solid rgba(57, 197, 187, 0.18);
   border-radius: var(--radius);
-  background: var(--control);
+  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-title);
   font-weight: 600;
   cursor: pointer;
   position: relative;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 .keycap:hover {
-  background: var(--control-hover);
+  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
+  border-color: rgba(57, 197, 187, 0.38);
+  box-shadow: 0 0 10px rgba(57, 197, 187, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 
 .keycap.is-waiting,
 .keycap.is-waiting:hover {
-  background: #2C2C2F;
+  background: linear-gradient(180deg, #232C44 0%, #1A2132 100%);
+  border-color: rgba(57, 197, 187, 0.5);
   color: var(--accent);
 }
 
@@ -554,7 +578,7 @@ html, body {
   height: 30px;
   border: 0;
   border-radius: var(--radius);
-  background: var(--control);
+  background: linear-gradient(180deg, #212A3F 0%, #1A2132 100%);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-md);
@@ -563,14 +587,15 @@ html, body {
 }
 
 .seg-btn:hover {
-  background: var(--control-hover);
+  background: linear-gradient(180deg, #29344E 0%, #212A3F 100%);
 }
 
 .seg-btn.is-active,
 .seg-btn.is-active:hover {
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
+  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  color: #071118;
+  font-weight: 700;
+  box-shadow: 0 1px 8px rgba(57, 197, 187, 0.28);
 }
 
 /* Sliders */
@@ -596,8 +621,8 @@ html, body {
   border-radius: 3px;
   background: linear-gradient(
     to right,
-    var(--accent) 0%,
-    var(--accent) var(--pct, 50%),
+    var(--miku-cyan) 0%,
+    var(--miku-pink) var(--pct, 50%),
     var(--rail-bg) var(--pct, 50%),
     var(--rail-bg) 100%
   );
@@ -608,11 +633,13 @@ html, body {
 .range-input::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
+  box-sizing: border-box;
   width: 13px;
   height: 13px;
   border-radius: 50%;
-  background: var(--text);
-  border: 0;
+  background: #ECF6FA;
+  border: 2px solid var(--miku-cyan);
+  box-shadow: 0 0 6px rgba(57, 197, 187, 0.55);
   cursor: pointer;
 }
 
@@ -728,11 +755,11 @@ html, body {
 }
 
 .toggle:hover input:not(:checked) + .toggle-track {
-  background: #38383B;
+  background: #33405C;
 }
 
 .toggle input:checked + .toggle-track {
-  background: var(--accent);
+  background: linear-gradient(135deg, #39C5BB 0%, #FF5CA8 100%);
 }
 
 .toggle-thumb {
@@ -747,7 +774,7 @@ html, body {
 
 .toggle input:checked + .toggle-track .toggle-thumb {
   left: 21px;
-  background: var(--bg);
+  background: #071118;
 }
 
 .toggle-sm {
@@ -794,7 +821,7 @@ html, body {
 }
 
 .select-input option {
-  background: #1b1b1b;
+  background: var(--surface);
   color: var(--text);
 }
 
@@ -807,7 +834,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   background: var(--glass-status);
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid rgba(57, 197, 187, 0.10);
   z-index: 2;
 }
 
@@ -823,16 +850,19 @@ html, body {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--miku-cyan);
+  box-shadow: 0 0 6px rgba(57, 197, 187, 0.65);
   flex-shrink: 0;
 }
 
 .status-dot.is-muted {
   background: var(--muted);
+  box-shadow: none;
 }
 
 .status-dot.is-error {
   background: var(--danger);
+  box-shadow: 0 0 6px rgba(255, 92, 138, 0.55);
 }
 
 .status-text {
@@ -869,7 +899,7 @@ html, body {
 .toast {
   padding: 8px 12px;
   border-radius: var(--radius);
-  background: #1b1b1b;
+  background: var(--surface);
   border: 1px solid var(--border);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: var(--fs-sm);
@@ -910,7 +940,7 @@ html, body {
 .modal-card {
   width: 460px;
   max-width: calc(100vw - 32px);
-  background: #1b1b1b;
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
@@ -961,7 +991,7 @@ html, body {
 
 .modal-footer {
   padding: 14px 22px;
-  background: #131314;
+  background: var(--surface-deep);
   border-top: 1px solid var(--border);
   display: flex;
   justify-content: flex-end;
@@ -998,7 +1028,7 @@ html, body {
 }
 
 #modal-install-wizard .modal-check input {
-  accent-color: var(--text);
+  accent-color: var(--miku-cyan);
 }
 
 #modal-install-wizard .modal-check + .modal-check {
@@ -1023,7 +1053,7 @@ html, body {
   justify-content: space-between;
   gap: 8px;
   background: var(--glass-status);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(57, 197, 187, 0.10);
   z-index: 3;
   user-select: none;
 }
@@ -1099,7 +1129,7 @@ html, body {
   border: 0;
   /* Solid panel, no per-card backdrop blur: dozens of blurred cards are one of the most
      expensive things WebView2 can composite while scrolling the gallery. */
-  background: #1b1b1b;
+  background: var(--surface);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
@@ -1117,7 +1147,7 @@ html, body {
   position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
-  background: #0D0D0E;
+  background: var(--surface-deep);
   overflow: hidden;
   cursor: pointer;
 }
@@ -1126,7 +1156,7 @@ html, body {
   content: '';
   position: absolute;
   inset: 0;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(57, 197, 187, 0.12);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.1s ease;
@@ -1166,7 +1196,7 @@ html, body {
   padding: 0;
   border-radius: 4px;
   border: 0;
-  background: rgba(19, 19, 20, 0.78);
+  background: rgba(10, 14, 22, 0.78);
   color: transparent;
   display: inline-flex;
   align-items: center;
@@ -1188,12 +1218,12 @@ html, body {
 }
 
 .clip-check:hover {
-  background: rgba(19, 19, 20, 0.94);
+  background: rgba(10, 14, 22, 0.94);
 }
 
 .clip-card.is-selected .clip-check {
   background: var(--accent);
-  color: var(--bg);
+  color: #071118;
 }
 
 .clip-duration {
@@ -1202,7 +1232,7 @@ html, body {
   bottom: 6px;
   padding: 2px 6px;
   border-radius: 3px;
-  background: rgba(19, 19, 20, 0.86);
+  background: rgba(10, 14, 22, 0.86);
   color: var(--text);
   font-size: var(--fs-cap);
   font-weight: 600;
@@ -1250,6 +1280,15 @@ html, body {
   padding: 0 8px;
   justify-content: center;
   gap: 5px;
+  border: 1px solid rgba(255, 92, 168, 0.30);
+  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.clip-share-btn:hover {
+  border-color: rgba(255, 92, 168, 0.55);
+  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
+  box-shadow: 0 0 10px rgba(255, 92, 168, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 
 .clip-share-btn svg {
@@ -1269,9 +1308,9 @@ html, body {
   width: 26px;
   height: 24px;
   padding: 0;
-  border: 0;
+  border: 1px solid rgba(57, 197, 187, 0.14);
   border-radius: var(--radius);
-  background: var(--control);
+  background: linear-gradient(180deg, #212A3F 0%, #1A2132 100%);
   color: var(--muted);
   display: inline-flex;
   align-items: center;
@@ -1285,18 +1324,19 @@ html, body {
 }
 
 .clip-icon-btn:hover {
-  background: var(--control-hover);
+  background: linear-gradient(180deg, #29344E 0%, #212A3F 100%);
   color: var(--text);
 }
 
 .clip-icon-btn.is-danger:hover {
   background: var(--danger-hover);
+  border-color: rgba(255, 92, 138, 0.35);
   color: var(--danger);
 }
 
 .clip-icon-btn.is-share:hover,
 .clip-share-btn:hover {
-  color: var(--accent);
+  color: var(--miku-pink-light);
 }
 
 .clip-icon-btn.is-busy,
@@ -1355,7 +1395,7 @@ html, body {
 .r2-storage-track {
   height: 4px;
   border-radius: 2px;
-  background: #131314;
+  background: var(--surface-deep);
   overflow: hidden;
 }
 
@@ -1363,12 +1403,12 @@ html, body {
   width: 0;
   height: 100%;
   border-radius: 2px;
-  background: var(--accent);
+  background: linear-gradient(90deg, #39C5BB 0%, #38BDF8 65%, #FF5CA8 100%);
   transition: width 160ms ease;
 }
 
 .r2-storage-bar.is-high {
-  background: var(--danger);
+  background: linear-gradient(90deg, #FF4D9D 0%, #FF6B8B 100%);
 }
 
 /* Caption under the auto-delete presets: wraps instead of truncating */
@@ -1406,7 +1446,7 @@ html, body {
   gap: 10px;
   padding: 7px 10px;
   border-radius: var(--radius);
-  background: #131314;
+  background: var(--surface-deep);
 }
 
 .r2-friend-main {
@@ -1470,7 +1510,7 @@ html, body {
   padding: 0 10px;
   border: 0;
   border-radius: var(--radius);
-  background: #131314;
+  background: var(--surface-deep);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-md);
@@ -1480,7 +1520,7 @@ html, body {
 }
 
 .text-input:focus {
-  background: #171719;
+  background: #121927;
 }
 
 .rename-ext {
@@ -1499,7 +1539,7 @@ html, body {
   z-index: 30;
   min-width: 176px;
   padding: 4px;
-  background: #1b1b1b;
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65);
@@ -1545,4 +1585,23 @@ html, body {
 
 .is-hidden {
   display: none !important;
+}
+
+/* Crisp Miku-cyan focus ring on every interactive control */
+.tab-btn:focus-visible,
+.seg-btn:focus-visible,
+.btn:focus-visible,
+.keycap:focus-visible,
+.win-btn:focus-visible,
+.update-pill:focus-visible,
+.clip-check:focus-visible,
+.clip-icon-btn:focus-visible,
+.select-input:focus-visible,
+.text-input:focus-visible,
+.range-input:focus-visible,
+.modal-close:focus-visible,
+.context-item:focus-visible,
+.toggle input:focus-visible + .toggle-track {
+  outline: 1px solid var(--miku-cyan);
+  outline-offset: 1px;
 }
