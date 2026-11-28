@@ -1373,20 +1373,6 @@ html, body {
   padding: 0 8px;
   justify-content: center;
   gap: 5px;
-  border: 1px solid;
-  border-top-color: var(--bevel-control-top);
-  border-left-color: var(--bevel-control-left);
-  border-right-color: var(--bevel-control-right);
-  border-bottom-color: var(--bevel-control-bottom);
-  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
-  box-shadow: var(--shadow-control);
-}
-
-/* Share keeps its own pink-tinted bevel so it reads apart from the plain secondary buttons. */
-.clip-share-btn:hover {
-  border-top-color: rgba(255, 130, 190, 0.48);
-  border-left-color: rgba(255, 130, 190, 0.34);
-  background: linear-gradient(to top, #1D263A 0%, #26314A 55%, #314060 100%);
 }
 
 .clip-share-btn svg {
@@ -1438,11 +1424,6 @@ html, body {
   border-left-color: rgba(255, 92, 138, 0.28);
   background: var(--danger-hover);
   color: var(--danger);
-}
-
-.clip-icon-btn.is-share:hover,
-.clip-share-btn:hover {
-  color: var(--miku-pink-light);
 }
 
 .clip-icon-btn.is-busy,
