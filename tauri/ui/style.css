@@ -40,6 +40,35 @@
   --danger-hover: rgba(255, 92, 138, 0.16);
   --rail-bg: #232D42;
 
+  /* 3D bevel borders: light sits top-left, so the top/left edges catch a faint Miku-cyan
+     highlight while the bottom/right edges fall into the canvas shadow. */
+  --bevel-card-top: rgba(150, 232, 245, 0.20);
+  --bevel-card-left: rgba(150, 232, 245, 0.16);
+  --bevel-card-right: rgba(4, 7, 14, 0.70);
+  --bevel-card-bottom: rgba(4, 7, 14, 0.85);
+
+  --bevel-control-top: rgba(165, 236, 250, 0.24);
+  --bevel-control-left: rgba(165, 236, 250, 0.18);
+  --bevel-control-right: rgba(4, 7, 14, 0.72);
+  --bevel-control-bottom: rgba(4, 7, 14, 0.88);
+  --bevel-control-top-hover: rgba(165, 236, 250, 0.36);
+  --bevel-control-left-hover: rgba(165, 236, 250, 0.26);
+
+  --bevel-accent-top: rgba(255, 255, 255, 0.42);
+  --bevel-accent-left: rgba(255, 255, 255, 0.28);
+  --bevel-accent-right: rgba(4, 10, 18, 0.36);
+  --bevel-accent-bottom: rgba(4, 10, 18, 0.48);
+
+  --bevel-inset-top: rgba(4, 7, 14, 0.75);
+  --bevel-inset-left: rgba(4, 7, 14, 0.75);
+  --bevel-inset-right: rgba(150, 232, 245, 0.10);
+  --bevel-inset-bottom: rgba(150, 232, 245, 0.10);
+
+  /* Super-slight elevation: the bevel does the shape work, the shadow only lifts the surface. */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.36);
+  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-accent: 0 1px 2px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+
   --fs-head: 17px;
   --fs-title: 15px;
   --fs-md: 13.5px;
@@ -114,21 +143,24 @@ html, body {
 .update-pill {
   height: 24px;
   padding: 0 11px;
-  border: 0;
+  border: 1px solid;
+  border-top-color: var(--bevel-accent-top);
+  border-left-color: var(--bevel-accent-left);
+  border-right-color: var(--bevel-accent-right);
+  border-bottom-color: var(--bevel-accent-bottom);
   border-radius: 999px;
-  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  background: linear-gradient(to top, #289EB0 0%, #39C5BB 55%, #56DFD7 100%);
   color: #071118;
   font-family: inherit;
   font-size: var(--fs-sm);
   font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
-  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.38);
+  box-shadow: var(--shadow-accent);
 }
 
 .update-pill:hover {
-  background: linear-gradient(135deg, #5BE3D9 0%, #5CC8FF 100%);
-  box-shadow: 0 2px 14px rgba(57, 197, 187, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.48);
+  background: linear-gradient(to top, #32B0C2 0%, #48D4CA 55%, #6FECE4 100%);
 }
 
 .update-pill:disabled {
@@ -239,10 +271,15 @@ html, body {
 /* No hover response on selected/active elements */
 .tab-btn.is-active,
 .tab-btn.is-active:hover {
-  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 52%, #FF5CA8 100%);
+  border: 1px solid;
+  border-top-color: var(--bevel-accent-top);
+  border-left-color: var(--bevel-accent-left);
+  border-right-color: var(--bevel-accent-right);
+  border-bottom-color: var(--bevel-accent-bottom);
+  background: linear-gradient(to top, #D63E88 0%, #38BDF8 54%, #63EAE0 100%);
   color: #071118;
   font-weight: 600;
-  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.26);
+  box-shadow: var(--shadow-accent);
 }
 
 /* Workspace */
@@ -299,11 +336,16 @@ html, body {
   height: 6px;
 }
 
-/* Flat cards */
+/* Cards: beveled top/left highlight, near-black bottom/right edge, slight lift */
 .glass-card {
   background: var(--glass-panel);
-  border: 1px solid var(--border);
+  border: 1px solid;
+  border-top-color: var(--bevel-card-top);
+  border-left-color: var(--bevel-card-left);
+  border-right-color: var(--bevel-card-right);
+  border-bottom-color: var(--bevel-card-bottom);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
 }
 
 .pill-row,
@@ -474,28 +516,36 @@ html, body {
 }
 
 .btn-primary {
-  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  border: 1px solid;
+  border-top-color: var(--bevel-accent-top);
+  border-left-color: var(--bevel-accent-left);
+  border-right-color: var(--bevel-accent-right);
+  border-bottom-color: var(--bevel-accent-bottom);
+  background: linear-gradient(to top, #289EB0 0%, #39C5BB 55%, #56DFD7 100%);
   color: #071118;
   font-weight: 700;
-  box-shadow: 0 2px 10px rgba(57, 197, 187, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.38);
+  box-shadow: var(--shadow-accent);
 }
 
 .btn-primary:hover {
-  background: linear-gradient(135deg, #5BE3D9 0%, #5CC8FF 100%);
-  box-shadow: 0 2px 14px rgba(57, 197, 187, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.48);
+  background: linear-gradient(to top, #32B0C2 0%, #48D4CA 55%, #6FECE4 100%);
 }
 
 .btn-secondary {
-  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
+  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
   color: var(--text);
-  border: 1px solid rgba(57, 197, 187, 0.18);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  box-shadow: var(--shadow-control);
 }
 
 .btn-secondary:hover {
-  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
-  border-color: rgba(57, 197, 187, 0.38);
-  box-shadow: 0 0 10px rgba(57, 197, 187, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  border-top-color: var(--bevel-control-top-hover);
+  border-left-color: var(--bevel-control-left-hover);
+  background: linear-gradient(to top, #1D263A 0%, #26314A 55%, #314060 100%);
 }
 
 .btn-danger {
@@ -506,19 +556,26 @@ html, body {
 
 .btn-danger:hover {
   background: var(--danger-hover);
-  border-color: rgba(255, 92, 138, 0.35);
+  border-top-color: rgba(255, 92, 138, 0.40);
+  border-left-color: rgba(255, 92, 138, 0.30);
+  border-right-color: rgba(4, 7, 14, 0.60);
+  border-bottom-color: rgba(4, 7, 14, 0.72);
 }
 
 .btn-danger-solid {
-  background: linear-gradient(135deg, #FF4D9D 0%, #FF6B8B 100%);
+  border: 1px solid;
+  border-top-color: var(--bevel-accent-top);
+  border-left-color: var(--bevel-accent-left);
+  border-right-color: var(--bevel-accent-right);
+  border-bottom-color: var(--bevel-accent-bottom);
+  background: linear-gradient(to top, #D4347D 0%, #FF4D9D 55%, #FF78B4 100%);
   color: #16060F;
   font-weight: 700;
-  box-shadow: 0 2px 10px rgba(255, 77, 157, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.34);
+  box-shadow: var(--shadow-accent);
 }
 
 .btn-danger-solid:hover {
-  background: linear-gradient(135deg, #FF6BB0 0%, #FF8598 100%);
-  box-shadow: 0 2px 14px rgba(255, 77, 157, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.44);
+  background: linear-gradient(to top, #E4428D 0%, #FF63AA 55%, #FF8FC1 100%);
 }
 
 .btn:disabled {
@@ -540,28 +597,33 @@ html, body {
   min-width: 76px;
   height: 30px;
   padding: 0 14px;
-  border: 1px solid rgba(57, 197, 187, 0.18);
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
   border-radius: var(--radius);
-  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
+  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-title);
   font-weight: 600;
   cursor: pointer;
   position: relative;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  box-shadow: var(--shadow-control);
 }
 
 .keycap:hover {
-  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
-  border-color: rgba(57, 197, 187, 0.38);
-  box-shadow: 0 0 10px rgba(57, 197, 187, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  border-top-color: var(--bevel-control-top-hover);
+  border-left-color: var(--bevel-control-left-hover);
+  background: linear-gradient(to top, #1D263A 0%, #26314A 55%, #314060 100%);
 }
 
 .keycap.is-waiting,
 .keycap.is-waiting:hover {
-  background: linear-gradient(180deg, #232C44 0%, #1A2132 100%);
-  border-color: rgba(57, 197, 187, 0.5);
+  border-top-color: rgba(57, 197, 187, 0.55);
+  border-left-color: rgba(57, 197, 187, 0.42);
+  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
   color: var(--accent);
 }
 
@@ -576,26 +638,37 @@ html, body {
 
 .seg-btn {
   height: 30px;
-  border: 0;
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
   border-radius: var(--radius);
-  background: linear-gradient(180deg, #212A3F 0%, #1A2132 100%);
+  background: linear-gradient(to top, #161C2B 0%, #232D45 100%);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-md);
   font-weight: 500;
   cursor: pointer;
+  box-shadow: var(--shadow-control);
 }
 
 .seg-btn:hover {
-  background: linear-gradient(180deg, #29344E 0%, #212A3F 100%);
+  border-top-color: var(--bevel-control-top-hover);
+  border-left-color: var(--bevel-control-left-hover);
+  background: linear-gradient(to top, #1C2437 0%, #2B3855 100%);
 }
 
 .seg-btn.is-active,
 .seg-btn.is-active:hover {
-  background: linear-gradient(135deg, #39C5BB 0%, #38BDF8 100%);
+  border-top-color: var(--bevel-accent-top);
+  border-left-color: var(--bevel-accent-left);
+  border-right-color: var(--bevel-accent-right);
+  border-bottom-color: var(--bevel-accent-bottom);
+  background: linear-gradient(to top, #2598BD 0%, #39C5BB 55%, #59E1D8 100%);
   color: #071118;
   font-weight: 700;
-  box-shadow: 0 1px 8px rgba(57, 197, 187, 0.28);
+  box-shadow: var(--shadow-accent);
 }
 
 /* Sliders */
@@ -806,18 +879,25 @@ html, body {
   min-width: 0;
   height: 28px;
   padding: 0 8px;
-  border: 0;
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
   border-radius: var(--radius);
-  background: var(--control);
+  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
   color: var(--text);
   font-family: inherit;
   font-size: var(--fs-md);
   outline: none;
   cursor: pointer;
+  box-shadow: var(--shadow-control);
 }
 
 .select-input:hover {
-  background: var(--control-hover);
+  border-top-color: var(--bevel-control-top-hover);
+  border-left-color: var(--bevel-control-left-hover);
+  background: linear-gradient(to top, #1D263A 0%, #26314A 55%, #314060 100%);
 }
 
 .select-input option {
@@ -900,14 +980,19 @@ html, body {
   padding: 8px 12px;
   border-radius: var(--radius);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid;
+  border-top-color: var(--bevel-card-top);
+  border-left-color: var(--bevel-card-left);
+  border-right-color: var(--bevel-card-right);
+  border-bottom-color: var(--bevel-card-bottom);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: var(--fs-sm);
 }
 
 .toast.is-warn,
 .toast.is-error {
-  border-color: var(--danger-hover);
+  border-top-color: rgba(255, 92, 138, 0.40);
+  border-left-color: rgba(255, 92, 138, 0.28);
 }
 
 .toast-title {
@@ -941,7 +1026,11 @@ html, body {
   width: 460px;
   max-width: calc(100vw - 32px);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid;
+  border-top-color: var(--bevel-card-top);
+  border-left-color: var(--bevel-card-left);
+  border-right-color: var(--bevel-card-right);
+  border-bottom-color: var(--bevel-card-bottom);
   border-radius: var(--radius);
   overflow: hidden;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.65);
@@ -1126,7 +1215,12 @@ html, body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border: 0;
+  border: 1px solid;
+  border-top-color: var(--bevel-card-top);
+  border-left-color: var(--bevel-card-left);
+  border-right-color: var(--bevel-card-right);
+  border-bottom-color: var(--bevel-card-bottom);
+  box-shadow: var(--shadow-card);
   /* Solid panel, no per-card backdrop blur: dozens of blurred cards are one of the most
      expensive things WebView2 can composite while scrolling the gallery. */
   background: var(--surface);
@@ -1280,15 +1374,20 @@ html, body {
   padding: 0 8px;
   justify-content: center;
   gap: 5px;
-  border: 1px solid rgba(255, 92, 168, 0.30);
-  background: linear-gradient(180deg, #242E46 0%, #1B2336 100%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
+  background: linear-gradient(to top, #171E2E 0%, #1F283D 55%, #28344E 100%);
+  box-shadow: var(--shadow-control);
 }
 
+/* Share keeps its own pink-tinted bevel so it reads apart from the plain secondary buttons. */
 .clip-share-btn:hover {
-  border-color: rgba(255, 92, 168, 0.55);
-  background: linear-gradient(180deg, #2C3958 0%, #212B44 100%);
-  box-shadow: 0 0 10px rgba(255, 92, 168, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  border-top-color: rgba(255, 130, 190, 0.48);
+  border-left-color: rgba(255, 130, 190, 0.34);
+  background: linear-gradient(to top, #1D263A 0%, #26314A 55%, #314060 100%);
 }
 
 .clip-share-btn svg {
@@ -1308,14 +1407,19 @@ html, body {
   width: 26px;
   height: 24px;
   padding: 0;
-  border: 1px solid rgba(57, 197, 187, 0.14);
+  border: 1px solid;
+  border-top-color: var(--bevel-control-top);
+  border-left-color: var(--bevel-control-left);
+  border-right-color: var(--bevel-control-right);
+  border-bottom-color: var(--bevel-control-bottom);
   border-radius: var(--radius);
-  background: linear-gradient(180deg, #212A3F 0%, #1A2132 100%);
+  background: linear-gradient(to top, #161D2C 0%, #242F47 100%);
   color: var(--muted);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  box-shadow: var(--shadow-control);
 }
 
 .clip-icon-btn svg {
@@ -1324,13 +1428,16 @@ html, body {
 }
 
 .clip-icon-btn:hover {
-  background: linear-gradient(180deg, #29344E 0%, #212A3F 100%);
+  border-top-color: var(--bevel-control-top-hover);
+  border-left-color: var(--bevel-control-left-hover);
+  background: linear-gradient(to top, #1C2538 0%, #2D3B58 100%);
   color: var(--text);
 }
 
 .clip-icon-btn.is-danger:hover {
+  border-top-color: rgba(255, 92, 138, 0.40);
+  border-left-color: rgba(255, 92, 138, 0.28);
   background: var(--danger-hover);
-  border-color: rgba(255, 92, 138, 0.35);
   color: var(--danger);
 }
 
@@ -1394,6 +1501,11 @@ html, body {
 
 .r2-storage-track {
   height: 4px;
+  border: 1px solid;
+  border-top-color: var(--bevel-inset-top);
+  border-left-color: var(--bevel-inset-left);
+  border-right-color: var(--bevel-inset-right);
+  border-bottom-color: var(--bevel-inset-bottom);
   border-radius: 2px;
   background: var(--surface-deep);
   overflow: hidden;
@@ -1445,6 +1557,11 @@ html, body {
   align-items: center;
   gap: 10px;
   padding: 7px 10px;
+  border: 1px solid;
+  border-top-color: var(--bevel-inset-top);
+  border-left-color: var(--bevel-inset-left);
+  border-right-color: var(--bevel-inset-right);
+  border-bottom-color: var(--bevel-inset-bottom);
   border-radius: var(--radius);
   background: var(--surface-deep);
 }
@@ -1508,7 +1625,11 @@ html, body {
   min-width: 0;
   height: 34px;
   padding: 0 10px;
-  border: 0;
+  border: 1px solid;
+  border-top-color: var(--bevel-inset-top);
+  border-left-color: var(--bevel-inset-left);
+  border-right-color: var(--bevel-inset-right);
+  border-bottom-color: var(--bevel-inset-bottom);
   border-radius: var(--radius);
   background: var(--surface-deep);
   color: var(--text);
@@ -1540,7 +1661,11 @@ html, body {
   min-width: 176px;
   padding: 4px;
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid;
+  border-top-color: var(--bevel-card-top);
+  border-left-color: var(--bevel-card-left);
+  border-right-color: var(--bevel-card-right);
+  border-bottom-color: var(--bevel-card-bottom);
   border-radius: var(--radius);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65);
   display: flex;
