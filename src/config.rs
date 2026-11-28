@@ -126,10 +126,10 @@ impl Default for Config {
             seconds: 30,
             hotkey_vk: 0x78, // F9
             hotkey_mods: 0,
-            fps: 60,
-            bitrate_mbps: 16, // "Medium"
-            codec: VideoCodec::H264,
-            max_height: 0,
+            fps: 30,
+            bitrate_mbps: 2,
+            codec: VideoCodec::Hevc,
+            max_height: 720,
             game_audio: true,
             game_volume: 100,
             desktop_audio: true,
@@ -263,6 +263,21 @@ fn default_output_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_use_lightweight_clip_settings() {
+        let cfg = Config::default();
+        assert_eq!(cfg.capture_mode, CaptureMode::GamesOnly);
+        assert_eq!(cfg.codec, VideoCodec::Hevc);
+        assert_eq!(cfg.fps, 30);
+        assert_eq!(cfg.max_height, 720);
+        assert_eq!(cfg.bitrate_mbps, 2);
+
+        // Defaults must survive `sanitize()` unchanged (loaded configs go through it).
+        let mut sanitized = cfg.clone();
+        sanitized.sanitize();
+        assert_eq!(sanitized.video_params(), cfg.video_params());
+    }
 
     #[test]
     fn capture_mode_defaults_to_games_only() {

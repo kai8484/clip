@@ -664,7 +664,21 @@ html, body {
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
+}
+
+.audio-sub {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  line-height: 1.3;
+  /* Desktop's subtext wraps to two lines; never truncate it. */
+  white-space: normal;
+}
+
+/* Pin the sliders to the card bottom so all three stay on one line. */
+.audio-pill > .slider-control {
+  margin-top: auto;
+  padding-top: 4px;
 }
 
 .audio-head {

@@ -207,7 +207,6 @@
     }
     if (name === 'cloudflare') {
       renderR2();
-      refreshR2Stats({ silent: true });
     }
     syncWindowHeight(true);
   }
@@ -1339,7 +1338,7 @@
     if (r2StatsError) {
       return { summary: r2StatsError, detail: '', tone: 'error', pct: 0 };
     }
-    if (r2StatsLoading || !r2Stats) {
+    if (!r2Stats) {
       return {
         summary: 'Loading\u2026',
         detail: 'Reading bucket usage\u2026',
@@ -1514,6 +1513,7 @@
     }
     if (r2StatsLoading) return;
     r2StatsLoading = true;
+    r2StatsError = null;
     renderR2();
     try {
       r2Stats = await invoke('get_r2_stats');
@@ -1547,7 +1547,6 @@
     } finally {
       r2TtlSaving = false;
       renderR2();
-      refreshR2Stats({ silent: true });
     }
   }
 
@@ -1796,9 +1795,6 @@
     renderHotkey();
 
     $('chk-autostart').checked = Boolean(recState.autostart);
-    $('txt-app-dir').textContent = recState.app_dir;
-    $('txt-app-dir').title = recState.app_dir;
-
     const dot = $('status-dot');
     const txt = $('status-text');
     const toggleWrap = $('status-toggle-wrap');
@@ -1931,7 +1927,7 @@
     setupState = state || null;
     $('inp-install-dir').value = (state && state.default_install_dir) || '';
     $('chk-install-shortcut').checked = true;
-    $('chk-install-autostart').checked = false;
+    $('chk-install-autostart').checked = true;
     setInstallBusy(false);
     // Nothing is recorded yet, so the background status bar must not claim otherwise.
     $('status-text').textContent = 'Setup required';
@@ -2436,11 +2432,6 @@
       }
     });
 
-    // Data folder
-    $('btn-open-data').addEventListener('click', () => {
-      invoke('open_folder', { target: 'data' });
-    });
-
     // Clip sharing settings
     const bindShareField = (id, key) => {
       const el = $(id);
@@ -2636,6 +2627,10 @@
         uploading: Boolean(p.uploading),
         uploadedUrl: p.uploaded_url ? p.uploaded_url : undefined,
       });
+      // A finished upload changes bucket usage; keep the Cloudflare storage numbers honest.
+      if (!p.uploading && p.uploaded_url && isShareConfigured()) {
+        refreshR2Stats({ silent: true });
+      }
     });
 
     await listen('update-status', (event) => {
