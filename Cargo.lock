@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "clip"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "embed-resource 2.5.2",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "clip-tauri"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clip",
  "png 0.17.16",

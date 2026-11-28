@@ -95,7 +95,10 @@ pub struct Converter {
     next: usize,
     /// Last converted `(frame_seq, texture)`: unchanged frames skip the video processor entirely.
     last: Option<(u64, ID3D11Texture2D)>,
-    black: ID3D11Texture2D,
+    w: u32,
+    h: u32,
+    /// Black NV12 stand-in for frames while the game is alt-tabbed; created on first use.
+    black: Option<ID3D11Texture2D>,
 }
 
 impl Converter {
@@ -194,7 +197,33 @@ impl Converter {
             let black = D3D11_VIDEO_COLOR { Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0.0, G: 0.0, B: 0.0, A: 1.0 } } };
             vctx.VideoProcessorSetOutputBackgroundColor(&vp, false, &black);
 
-            // Black NV12 frame (Y=16, UV=128) for "Games only" mode when no game is visible.
+            let mut done = None;
+            device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut done))?;
+
+            let fence = Fence::new(device, context);
+            Ok(Self {
+                src: src.clone(),
+                device: device.clone(),
+                context: context.clone(),
+                done: done.unwrap(),
+                fence,
+                vctx,
+                vp, input: input.unwrap(), pool, next: 0, last: None, w, h, black: None })
+        }
+    }
+
+    pub fn is_for(&self, frame: &Frame) -> bool {
+        self.src == frame.tex
+    }
+
+    /// Black NV12 frame (Y=16, UV=128) for "Games only" mode when the game is alt-tabbed.
+    /// Allocated on first use so idle sessions never pay for it.
+    pub fn black(&mut self) -> Result<ID3D11Texture2D> {
+        if let Some(t) = &self.black {
+            return Ok(t.clone());
+        }
+        let (w, h) = (self.w, self.h);
+        let tex = unsafe {
             let (bw, bh) = (w as usize, h as usize);
             let mut px = vec![16u8; bw * bh];
             px.resize(bw * bh * 3 / 2, 128);
@@ -211,30 +240,12 @@ impl Converter {
                 CPUAccessFlags: 0,
                 MiscFlags: 0,
             };
-            let mut black = None;
-            device.CreateTexture2D(&bd, Some(&init), Some(&mut black))?;
-
-            let mut done = None;
-            device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut done))?;
-
-            let fence = Fence::new(device, context);
-            Ok(Self {
-                src: src.clone(),
-                device: device.clone(),
-                context: context.clone(),
-                done: done.unwrap(),
-                fence,
-                vctx,
-                vp, input: input.unwrap(), pool, next: 0, last: None, black: black.unwrap() })
-        }
-    }
-
-    pub fn is_for(&self, frame: &Frame) -> bool {
-        self.src == frame.tex
-    }
-
-    pub fn black(&self) -> ID3D11Texture2D {
-        self.black.clone()
+            let mut tex = None;
+            self.device.CreateTexture2D(&bd, Some(&init), Some(&mut tex))?;
+            tex.unwrap()
+        };
+        self.black = Some(tex.clone());
+        Ok(tex)
     }
 
     /// Converts the current frame into a pooled NV12 texture and waits for GPU completion;

@@ -1,12 +1,14 @@
 //! Clip gallery helpers: video detection, display names, file naming/validation, Recycle Bin
-//! deletion, and reading duration/dimensions/codec plus an RGBA cover thumbnail.
+//! deletion, and reading duration/dimensions/codec plus an RGB8 cover thumbnail.
 //!
 //! Covers are decoded in one frame: CPU RGB32 `IMFSourceReader` first (~60 ms), GPU decode as a
 //! fallback (handles codecs the CPU path rejects), and Windows Shell thumbnails last (handles
-//! codecs like HEVC without the Media Foundation extension).
+//! codecs like HEVC without the Media Foundation extension). The CPU decode reuses the reader the
+//! probe already opened, so a cover costs one `IMFSourceReader` per clip instead of two.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{anyhow, Result};
 use windows::core::{Interface, GUID, HSTRING, PROPVARIANT};
@@ -26,7 +28,7 @@ const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 const SOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
 const EOS: u32 = MF_SOURCE_READERF_ENDOFSTREAM.0 as u32;
 
-/// Largest frame dimension accepted from a decoder (protects `to_rgba` allocations).
+/// Largest frame dimension accepted from a decoder (protects `to_rgb` allocations).
 const MAX_DIM: u32 = 16_384;
 
 // --- Names and files -------------------------------------------------------------------
@@ -210,8 +212,38 @@ unsafe fn reader(path: &Path, video_processing: bool, d3d: Option<&IMFDXGIDevice
     Ok(MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &a)?)
 }
 
+/// A device manager that is safe to move between threads: the D3D11 device behind it has
+/// `ID3D11Multithread::SetMultithreadProtected` set, so decoders on any thread can share it.
+struct SharedMgr(IMFDXGIDeviceManager);
+unsafe impl Send for SharedMgr {}
+
+/// One D3D11 device for every clip decode: creating one per clip costs ~10 ms and keeps a device
+/// (and its VRAM) alive as long as the decoder that owns it.
+static D3D_MANAGER: OnceLock<Mutex<Option<SharedMgr>>> = OnceLock::new();
+
+fn d3d_slot() -> &'static Mutex<Option<SharedMgr>> {
+    D3D_MANAGER.get_or_init(|| Mutex::new(None))
+}
+
+/// Shared GPU device manager, created on first use.
+fn d3d_manager() -> Result<IMFDXGIDeviceManager> {
+    let mut slot = d3d_slot().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(m) = slot.as_ref() {
+        return Ok(m.0.clone());
+    }
+    let mgr = unsafe { create_d3d_manager() }?;
+    *slot = Some(SharedMgr(mgr.clone()));
+    Ok(mgr)
+}
+
+/// Drops the cached device after a failed decode so a reset device or a driver restart recovers
+/// instead of failing every later clip.
+fn forget_d3d_manager() {
+    *d3d_slot().lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 /// GPU device for Media Foundation: decode and scale without going through the CPU.
-unsafe fn d3d_manager() -> Result<IMFDXGIDeviceManager> {
+unsafe fn create_d3d_manager() -> Result<IMFDXGIDeviceManager> {
     let mut device = None;
     D3D11CreateDevice(
         None,
@@ -241,9 +273,11 @@ unsafe fn seek(r: &IMFSourceReader, t: i64) -> Result<()> {
     Ok(())
 }
 
-fn probe(path: &Path) -> Result<Probe> {
+/// Metadata read through the probe reader, returned with that same open reader so the cover decode
+/// does not open the file a second time.
+fn probe(path: &Path) -> Result<(Probe, IMFSourceReader)> {
     unsafe {
-        let r = reader(path, false, None, false)?;
+        let r = reader(path, true, None, true)?;
         let duration = r
             .GetPresentationAttribute(SOURCE, &MF_PD_DURATION)
             .ok()
@@ -251,7 +285,8 @@ fn probe(path: &Path) -> Result<Probe> {
             .unwrap_or(0) as i64;
         let vt = r.GetNativeMediaType(VIDEO, 0).map_err(|_| anyhow!("the file has no video"))?;
         let (width, height) = unpack(vt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0));
-        Ok(Probe { duration, width, height, subtype: vt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default() })
+        let pr = Probe { duration, width, height, subtype: vt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default() };
+        Ok((pr, r))
     }
 }
 
@@ -261,30 +296,41 @@ pub struct ClipMedia {
     pub width: u32,
     pub height: u32,
     pub codec: &'static str,
-    pub cover_rgba: Option<(u32, u32, Vec<u8>)>,
+    pub cover_rgb: Option<(u32, u32, Vec<u8>)>,
 }
 
-/// Reads duration, dimensions, codec, and extracts an RGBA8 cover thumbnail up to `max_w` px wide.
+/// Reads duration, dimensions, codec, and extracts an RGB8 cover thumbnail up to `max_w` px wide.
 pub fn probe_and_cover(p: &Path, max_w: u32) -> Result<ClipMedia, String> {
     let _mf = Mf::init();
-    let pr = probe(p).map_err(|e| e.to_string())?;
+    let (pr, r) = probe(p).map_err(|e| e.to_string())?;
     Ok(ClipMedia {
         duration_ms: (pr.duration.max(0) / 10_000) as u64,
         width: pr.width,
         height: pr.height,
         codec: pr.codec(),
-        cover_rgba: decode_cover(p, &pr, max_w),
+        cover_rgb: decode_cover(p, &pr, max_w, r),
     })
 }
 
 /// Cover thumbnail: keyframe just before 1 s (or midpoint if shorter), decoded in one frame.
-fn decode_cover(p: &Path, pr: &Probe, max_w: u32) -> Option<(u32, u32, Vec<u8>)> {
+/// The CPU attempt reuses the probe reader; the GPU fallback opens its own and is tried once.
+fn decode_cover(p: &Path, pr: &Probe, max_w: u32, r: IMFSourceReader) -> Option<(u32, u32, Vec<u8>)> {
     let (w, h) = fit(pr, max_w);
-    Video::open_cpu(p, w, h)
-        .or_else(|_| Video::open(p, w, h, true))
-        .ok()
-        .and_then(|mut v| v.key_frame_before((pr.duration / 2).min(10_000_000)).ok().flatten())
-        .or_else(|| shell_cover_image(p, max_w))
+    let t = (pr.duration / 2).min(10_000_000);
+    if let Ok(mut v) = unsafe { Video::from_reader(r, w, h) } {
+        if let Ok(Some(c)) = v.key_frame_before(t) {
+            return Some(c);
+        }
+    }
+    match Video::open_gpu(p, w, h, true) {
+        Ok(mut v) => match v.key_frame_before(t) {
+            Ok(Some(c)) => return Some(c),
+            Ok(None) => {}
+            Err(_) => forget_d3d_manager(),
+        },
+        Err(_) => forget_d3d_manager(),
+    }
+    shell_cover_image(p, max_w)
 }
 
 fn fit(p: &Probe, w: u32) -> (u32, u32) {
@@ -301,30 +347,18 @@ struct Video {
 }
 
 impl Video {
-    /// CPU decoder for a single frame (cover thumbnails): opens in ~60 ms vs ~300 ms for GPU.
-    fn open_cpu(path: &Path, w: u32, h: u32) -> Result<Video> {
-        unsafe { Self::configure(path, w, h, None, true) }
-    }
-
-    /// With `still` enabled, the decoder emits each frame immediately without buffering,
-    /// saving ~20 ms per seek.
-    fn open(path: &Path, w: u32, h: u32, still: bool) -> Result<Video> {
+    /// GPU decoder on the shared device manager. With `still` enabled, the decoder emits each frame
+    /// immediately without buffering, saving ~20 ms per seek.
+    fn open_gpu(path: &Path, w: u32, h: u32, still: bool) -> Result<Video> {
         unsafe {
-            // Try GPU decode first; fall back to CPU on any failure.
-            if let Ok(mgr) = d3d_manager() {
-                if let Ok(mut v) = Self::configure(path, w, h, Some(&mgr), still) {
-                    if v.next().is_ok() {
-                        seek(&v.r, 0)?;
-                        return Ok(v);
-                    }
-                }
-            }
-            Self::configure(path, w, h, None, still)
+            let mgr = d3d_manager()?;
+            let r = reader(path, true, Some(&mgr), still)?;
+            Self::from_reader(r, w, h)
         }
     }
 
-    unsafe fn configure(path: &Path, w: u32, h: u32, mgr: Option<&IMFDXGIDeviceManager>, still: bool) -> Result<Video> {
-        let r = reader(path, true, mgr, still)?;
+    /// Switches an already open reader to RGB32 output at `w`x`h`.
+    unsafe fn from_reader(r: IMFSourceReader, w: u32, h: u32) -> Result<Video> {
         r.SetStreamSelection(MF_SOURCE_READER_ANY_STREAM.0 as u32, false)?;
         r.SetStreamSelection(VIDEO, true)?;
         let t = MFCreateMediaType()?;
@@ -376,27 +410,28 @@ impl Video {
         }
     }
 
-    /// Converts a decoded RGB32 sample into straight RGBA8 pixels.
-    fn to_rgba(&self, s: &IMFSample) -> Result<(u32, u32, Vec<u8>)> {
+    /// Converts a decoded RGB32 sample into packed RGB8 pixels (3 bytes per pixel).
+    fn to_rgb(&self, s: &IMFSample) -> Result<(u32, u32, Vec<u8>)> {
         let (w, h) = (self.w as usize, self.h as usize);
         if w == 0 || h == 0 || w > MAX_DIM as usize || h > MAX_DIM as usize {
             return Err(anyhow!("invalid video frame size {w}x{h}"));
         }
         let count = w.checked_mul(h).ok_or_else(|| anyhow!("video frame size overflow"))?;
-        let out_len = count.checked_mul(4).ok_or_else(|| anyhow!("video frame size overflow"))?;
+        // The decoder always hands back RGB32 (4 bytes per pixel); only the output is packed RGB.
+        let out_len = count.checked_mul(3).ok_or_else(|| anyhow!("video frame size overflow"))?;
         let row = w.checked_mul(4).ok_or_else(|| anyhow!("video row size overflow"))?;
-        let mut rgba = vec![0u8; out_len];
+        let out_row = w.checked_mul(3).ok_or_else(|| anyhow!("video row size overflow"))?;
+        let mut rgb = vec![0u8; out_len];
         unsafe {
             let b = s.ConvertToContiguousBuffer()?;
             // Copies `h` rows of RGB32 pixels; `pitch` may be negative for bottom-up buffers.
             let copy = |base: *const u8, pitch: i32, out: &mut [u8]| -> Result<()> {
                 for y in 0..h {
                     let src = std::slice::from_raw_parts(base.offset(y as isize * pitch as isize), row);
-                    for (d, s) in out[y * row..(y + 1) * row].as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+                    for (d, s) in out[y * out_row..(y + 1) * out_row].as_chunks_mut::<3>().0.iter_mut().zip(src.as_chunks::<4>().0) {
                         d[0] = s[2];
                         d[1] = s[1];
                         d[2] = s[0];
-                        d[3] = 255;
                     }
                 }
                 Ok(())
@@ -405,7 +440,7 @@ impl Video {
                 let (mut p, mut pitch, mut start, mut len) =
                     (std::ptr::null_mut(), 0i32, std::ptr::null_mut(), 0u32);
                 b2.Lock2DSize(MF2DBuffer_LockFlags_Read, &mut p, &mut pitch, &mut start, &mut len)?;
-                let r = check_rows(p, pitch, start, len as usize, row, h).and_then(|_| copy(p, pitch, &mut rgba));
+                let r = check_rows(p, pitch, start, len as usize, row, h).and_then(|_| copy(p, pitch, &mut rgb));
                 let unlock = b2.Unlock2D();
                 r?;
                 unlock?;
@@ -415,7 +450,7 @@ impl Video {
                 b2.Lock2D(&mut p, &mut pitch)?;
                 // Lock2D does not expose the buffer start, so measure the plane from `p` itself.
                 let len = b.GetCurrentLength().or_else(|_| b.GetMaxLength()).unwrap_or(0) as usize;
-                let r = check_rows(p, pitch, p, len, row, h).and_then(|_| copy(p, pitch, &mut rgba));
+                let r = check_rows(p, pitch, p, len, row, h).and_then(|_| copy(p, pitch, &mut rgb));
                 let unlock = b2.Unlock2D();
                 r?;
                 unlock?;
@@ -424,19 +459,19 @@ impl Video {
                 let mut len = 0u32;
                 b.Lock(&mut p, None, Some(&mut len))?;
                 let r = check_contiguous(p, self.stride, len as usize, row, h)
-                    .and_then(|base| copy(base, self.stride, &mut rgba));
+                    .and_then(|base| copy(base, self.stride, &mut rgb));
                 let unlock = b.Unlock();
                 r?;
                 unlock?;
             }
         }
-        Ok((self.w, self.h, rgba))
+        Ok((self.w, self.h, rgb))
     }
 
     /// Decodes the keyframe at or before `t` in a single frame read.
     fn key_frame_before(&mut self, t: i64) -> Result<Option<(u32, u32, Vec<u8>)>> {
         unsafe { seek(&self.r, t)? };
-        self.next()?.map(|(_, _, s)| self.to_rgba(&s)).transpose()
+        self.next()?.map(|(_, _, s)| self.to_rgb(&s)).transpose()
     }
 }
 
@@ -551,17 +586,17 @@ fn shell_cover_image(p: &Path, max_w: u32) -> Option<(u32, u32, Vec<u8>)> {
 
             let target_w = max_w as usize;
             if sw <= target_w {
-                let mut rgba = Vec::with_capacity(sw * sh * 4);
+                let mut rgb = Vec::with_capacity(sw * sh * 3);
                 for px in bgra.as_chunks::<4>().0 {
-                    rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                    rgb.extend_from_slice(&[px[2], px[1], px[0]]);
                 }
-                return Some((sw as u32, sh as u32, rgba));
+                return Some((sw as u32, sh as u32, rgb));
             }
 
             // Box-filter downscale so cached thumbnails stay crisp and lightweight.
             let dw = target_w.max(2);
             let dh = (dw * sh / sw).max(2);
-            let mut rgba = Vec::with_capacity(dw * dh * 4);
+            let mut rgb = Vec::with_capacity(dw * dh * 3);
             for y in 0..dh {
                 let y0 = y * sh / dh;
                 let y1 = ((y + 1) * sh / dh).max(y0 + 1).min(sh);
@@ -579,10 +614,10 @@ fn shell_cover_image(p: &Path, max_w: u32) -> Option<(u32, u32, Vec<u8>)> {
                             n += 1;
                         }
                     }
-                    rgba.extend_from_slice(&[(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]);
+                    rgb.extend_from_slice(&[(r / n) as u8, (g / n) as u8, (b / n) as u8]);
                 }
             }
-            Some((dw as u32, dh as u32, rgba))
+            Some((dw as u32, dh as u32, rgb))
         })();
         if com {
             CoUninitialize();
@@ -632,6 +667,24 @@ mod tests {
         assert!(!filename_ok("nul.mp4"));
         assert!(!filename_ok("lpt9."));
         assert!(!filename_ok("bad?name"));
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_probe_and_cover() {
+        let sample = Path::new(r"Z:\other shit\Downloads\clip\clips\clip_2026-11-26_18-18-01.mp4");
+        if !sample.is_file() {
+            println!("BENCH library: skipped (sample clip missing)");
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let mut cover_bytes = 0usize;
+        for _ in 0..3 {
+            let m = probe_and_cover(sample, 480).unwrap();
+            cover_bytes = m.cover_rgb.map(|(_, _, v)| v.len()).unwrap_or(0);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("BENCH library: probe_and_cover_3x={ms:.3}ms ({:.2}ms/clip) cover_raw={cover_bytes}B", ms / 3.0);
     }
 
     #[test]

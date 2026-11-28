@@ -6,6 +6,8 @@
   let cfg = null;
   let recState = null;
   let mics = [];
+  // Device enumeration is a WASAPI probe: only run it once the mic picker is actually needed.
+  let micsLoaded = false;
   let capturingHotkey = false;
   let draggingSlider = false;
   let saveTimer = null;
@@ -205,8 +207,16 @@
       refreshClips({ silent: true });
       return;
     }
+    if (name === 'settings') {
+      // Device enumeration is only needed once the mic picker is visible.
+      if (cfg?.mic_audio && !micsLoaded) ensureMicsLoaded();
+    }
     if (name === 'cloudflare') {
       renderR2();
+      // `renderConfig` skips the usage call while this tab is hidden, so catch up here.
+      if (isShareConfigured() && renderedStatsKey !== shareConfigKey()) {
+        refreshR2Stats({ silent: true });
+      }
     }
     syncWindowHeight(true);
   }
@@ -754,18 +764,9 @@
 
     ensureThumbObserver();
 
-    // Reconcile in place: existing cards keep their DOM and loaded thumbnails; new cards go into
-    // a fragment and everything is ordered with a single insertion (no `grid.innerHTML = ''`).
-    const frag = document.createDocumentFragment();
-    clips.forEach((clip, idx) => {
-      let card = cardMap.get(clip.path);
-      if (!card) {
-        card = createClipCard(clip);
-        cardMap.set(clip.path, card);
-      }
-      updateClipCard(card, clip, idx);
-      frag.appendChild(card);
-    });
+    // Reconcile in place: delete stale cards first, then order the live ones with `insertBefore`
+    // only where they are actually out of place. Untouched cards stay mounted, so their
+    // `content-visibility: auto` sizes and decoded image layers survive re-renders.
     for (const [path, card] of Array.from(cardMap)) {
       if (!validPaths.has(path)) {
         card.remove();
@@ -774,7 +775,17 @@
         dropPreviewForPath(path);
       }
     }
-    grid.appendChild(frag);
+    clips.forEach((clip, idx) => {
+      let card = cardMap.get(clip.path);
+      if (!card) {
+        card = createClipCard(clip);
+        cardMap.set(clip.path, card);
+      }
+      updateClipCard(card, clip, idx);
+      if (grid.children[idx] !== card) {
+        grid.insertBefore(card, grid.children[idx] || null);
+      }
+    });
 
     updateClipsToolbar();
     if (scrollEl && prevScroll > 0) {
@@ -837,6 +848,10 @@
 
   function isShareConfigured() {
     return Boolean(cfg && cfg.share_url?.trim() && cfg.has_share_key);
+  }
+
+  function shareConfigKey() {
+    return `${(cfg?.share_url || '').trim()}|${cfg?.has_share_key ? '1' : '0'}`;
   }
 
   function isClipUploading(clip) {
@@ -913,8 +928,8 @@
   }
 
   function refreshAllCardShareUI() {
-    for (const [path, card] of cardMap) {
-      updateCardShareUI(card, clips.find((c) => c.path === path) || null);
+    for (const card of cardMap.values()) {
+      updateCardShareUI(card, currentClipForCard(card));
     }
   }
 
@@ -1072,8 +1087,6 @@
       }
       closeRenameModal();
       await refreshClips({ silent: true });
-      recState = await invoke('recorder_state');
-      renderState();
     } catch (e) {
       errEl.textContent = String(e);
       errEl.classList.remove('is-hidden');
@@ -1129,8 +1142,6 @@
       }
       closeDeleteModal();
       await refreshClips({ silent: true });
-      recState = await invoke('recorder_state');
-      renderState();
       if (res.failed && res.failed.length > 0) {
         const first = res.failed[0];
         showToast('error', `Couldn't delete ${res.failed.length} clip(s)`, `${first.name}: ${first.error}`);
@@ -1238,7 +1249,7 @@
 
     // Input device
     $('row-mic-device').classList.toggle('is-hidden', !cfg.mic_audio);
-    renderMicList();
+    if (micsLoaded) renderMicList();
 
     // Preferences
     const soundOn = Boolean(cfg.sound_on_save);
@@ -1270,7 +1281,7 @@
 
     // Turning R2 on or off changes what every card button does; changing the share URL invalidates
     // the uploads recorded for it, so the gallery is re-listed.
-    const shareKey = `${(cfg.share_url || '').trim()}|${cfg.has_share_key ? '1' : '0'}`;
+    const shareKey = shareConfigKey();
     if (renderedShareConfig !== null && renderedShareConfig !== shareKey) {
       refreshAllCardShareUI();
       if (clipsLoadedOnce) {
@@ -1282,18 +1293,25 @@
 
     // R2 admin calls need both halves, so usage is (re)loaded whenever the credentials behind it change.
     const shareReady = isShareConfigured();
-    if (shareReady && renderedStatsKey !== shareKey) {
-      refreshR2Stats({ silent: true });
-    } else if (!shareReady) {
+    if (!shareReady) {
       r2Stats = null;
       r2StatsError = null;
+      renderedStatsKey = null;
     }
-    renderedStatsKey = shareReady ? shareKey : null;
-    renderR2();
+    // The Cloudflare card is invisible on every other tab: skip the usage call and the render there,
+    // and leave `renderedStatsKey` stale so `switchTab('cloudflare')` loads it when it is shown.
+    if (activeTab === 'cloudflare') {
+      if (shareReady && renderedStatsKey !== shareKey) {
+        refreshR2Stats({ silent: true });
+      }
+      renderedStatsKey = shareReady ? shareKey : null;
+      renderR2();
+    }
 
     renderEstimatedSize();
 
-    syncWindowHeight(true);
+    // `renderR2()` refits the window by itself when the Cloudflare tab is the visible one.
+    if (activeTab !== 'cloudflare') syncWindowHeight(true);
   }
 
   // ---- Cloudflare R2 tab ---------------------------------------------------------------------
@@ -1760,6 +1778,20 @@
     if (el) el.textContent = estimateClipSizeText(cfg);
   }
 
+  // Loads the capture devices on first need and renders the picker; a failure leaves it unloaded so
+  // the next tab visit or refresh click retries.
+  async function ensureMicsLoaded() {
+    if (micsLoaded) return;
+    micsLoaded = true;
+    try {
+      mics = (await invoke('list_mics')) || [];
+    } catch (_) {
+      micsLoaded = false;
+      return;
+    }
+    renderMicList();
+  }
+
   function renderMicList() {
     if (!cfg) return;
     const sel = $('sel-mic-device');
@@ -1969,10 +2001,9 @@
 
   async function reloadAfterInstall() {
     try {
-      const [loadedCfg, loadedState, loadedMics, loadedClips] = await Promise.all([
+      const [loadedCfg, loadedState, loadedClips] = await Promise.all([
         invoke('get_config'),
         invoke('recorder_state'),
-        invoke('list_mics'),
         invoke('list_clips').catch((e) => {
           showToast('error', "Couldn't load clips", String(e));
           return null;
@@ -1980,7 +2011,6 @@
       ]);
       cfg = loadedCfg;
       recState = loadedState;
-      mics = loadedMics || [];
       renderConfig();
       renderState();
       invoke('get_update_status')
@@ -2395,8 +2425,9 @@
     $('chk-mic-audio').addEventListener('change', async (e) => {
       if (!cfg) return;
       cfg.mic_audio = e.target.checked;
-      if (cfg.mic_audio) {
-        mics = await invoke('list_mics');
+      if (cfg.mic_audio && !micsLoaded) {
+        mics = (await invoke('list_mics')) || [];
+        micsLoaded = true;
       }
       renderConfig();
       commitConfigNow();
@@ -2409,7 +2440,8 @@
       renderConfig();
     });
     $('btn-refresh-mics').addEventListener('click', async () => {
-      mics = await invoke('list_mics');
+      mics = (await invoke('list_mics')) || [];
+      micsLoaded = true;
       renderMicList();
     });
 
@@ -2578,12 +2610,19 @@
     window.addEventListener('focus', async () => {
       // Closing the folder picker returns focus mid-wizard; refreshing there fights the modal.
       if (installWizardOpen()) return;
+      if (activeTab === 'clips') {
+        // The gallery scan already refreshes the cached count in Rust, so no extra
+        // `recorder_state` (whole-folder rescan + registry read) is needed on the clips tab.
+        await refreshClips({ silent: true });
+        if (recState) {
+          recState.clips_count = clips.length;
+          renderState();
+        }
+        return;
+      }
       try {
         recState = await invoke('recorder_state');
         renderState();
-        if (activeTab === 'clips') {
-          refreshClips({ silent: true });
-        }
       } catch (_) {}
     });
   }
@@ -2667,10 +2706,9 @@
 
     let clipsError = null;
     try {
-      const [loadedCfg, loadedState, loadedMics, loadedClips] = await Promise.all([
+      const [loadedCfg, loadedState, loadedClips] = await Promise.all([
         invoke('get_config'),
         invoke('recorder_state'),
-        invoke('list_mics'),
         // A failing gallery must not stop the config and recorder state from initializing.
         invoke('list_clips').catch((e) => {
           clipsError = e;
@@ -2680,7 +2718,6 @@
 
       cfg = loadedCfg;
       recState = loadedState;
-      mics = loadedMics || [];
 
       renderConfig();
       renderState();

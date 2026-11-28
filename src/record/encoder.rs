@@ -502,17 +502,42 @@ fn is_keyframe(d: &[u8], is_hevc: bool) -> bool {
 /// Scans one Annex-B frame in a single pass: returns whether it holds an IDR picture and appends the
 /// parameter sets (H.264: SPS/PPS; HEVC: VPS/SPS/PPS) to `ps`, start-code prefixed. Stops at the
 /// first VCL NAL, as nothing after the first slice can be a parameter set.
+///
+/// Unlike `Nals`, the VCL check happens right after the start code instead of after locating the next
+/// one: a slice payload is megabytes long and only its header byte decides the return value.
 fn scan_frame(d: &[u8], is_hevc: bool, ps: &mut Vec<u8>) -> bool {
-    for n in Nals::new(d) {
-        let t = nal_type(n, is_hevc);
+    let mut at = 0usize;
+    while at < d.len() {
+        let Some(code) = (at..d.len().saturating_sub(2)).find(|&i| d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
+        else {
+            return false;
+        };
+        let start = code + 3;
+        if start >= d.len() {
+            return false;
+        }
+        // `00 00 01 00 00 01` leaves an empty NAL between two start codes: no header to inspect.
+        // HEVC TRAIL_N (type 0) starts with a 0x00 byte, so the second byte must be checked too.
+        if d[start] == 0 && d.get(start + 1).copied().unwrap_or(0) == 0 {
+            at = start;
+            continue;
+        }
+        let t = nal_type(&d[start..], is_hevc);
         if is_vcl(t, is_hevc) {
             return is_idr(t, is_hevc);
         }
-        let is_ps = if is_hevc { matches!(t, 32..=34) } else { matches!(t, 7 | 8) };
-        if is_ps {
-            ps.extend_from_slice(&[0, 0, 0, 1]);
-            ps.extend_from_slice(n);
+        let next = (start..d.len().saturating_sub(2)).find(|&i| d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1);
+        let mut end = next.unwrap_or(d.len());
+        // The NAL ends at the next start code, whose leading zeros are not part of the payload.
+        while end > start && d[end - 1] == 0 {
+            end -= 1;
         }
+        let is_ps = if is_hevc { matches!(t, 32..=34) } else { matches!(t, 7 | 8) };
+        if is_ps && end > start {
+            ps.extend_from_slice(&[0, 0, 0, 1]);
+            ps.extend_from_slice(&d[start..end]);
+        }
+        at = next.unwrap_or(d.len());
     }
     false
 }
@@ -567,5 +592,54 @@ mod tests {
 
         let mut ps = Vec::new();
         assert!(!scan_frame(&[0, 0, 1, 0x02, 0x01], true, &mut ps)); // TRAIL_R (1): not a keyframe
+    }
+
+    #[test]
+    fn scan_frame_skips_empty_zero_padded_nals() {
+        // `00 00 01` directly followed by zero padding and another start code: the NAL is empty.
+        let mut f = vec![0, 0, 1, 0, 0, 0, 1];
+        f.extend_from_slice(&[0x26, 0x01]); // HEVC IDR_W_RADL (19)
+        let mut ps = Vec::new();
+        assert!(scan_frame(&f, true, &mut ps));
+        assert!(ps.is_empty());
+
+        // HEVC TRAIL_N (type 0) has a 0x00 header byte: it is a real NAL, not padding.
+        let mut f = vec![0, 0, 1, 0, 0];
+        f.extend_from_slice(&[0, 0, 1, 0x00, 0x01]);
+        let mut ps = Vec::new();
+        assert!(!scan_frame(&f, true, &mut ps));
+        assert!(ps.is_empty());
+
+        // Same padding shape before an IDR: the empty NAL must not hide the VCL NAL that follows.
+        let mut f = vec![0, 0, 1, 0, 0];
+        f.extend_from_slice(&[0, 0, 1, 0x26, 0x01]);
+        let mut ps = Vec::new();
+        assert!(scan_frame(&f, true, &mut ps));
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_scan_frame() {
+        let mut frame = vec![0, 0, 0, 1, 0x40, 0x01, 0, 0, 1, 0x42, 0x01, 0, 0, 1, 0x44, 0x01];
+        frame.extend_from_slice(&[0, 0, 1, 0x02, 0x01]); // HEVC TRAIL_R (1)
+        frame.resize(frame.len() + 128 * 1024, 0x5A);
+
+        let mut ps = Vec::with_capacity(64);
+        let iters = 4_000usize;
+        let t0 = std::time::Instant::now();
+        let mut idrs = 0usize;
+        for _ in 0..iters {
+            ps.clear();
+            if scan_frame(&frame, true, &mut ps) {
+                idrs += 1;
+            }
+        }
+        let elapsed = t0.elapsed();
+        let gb_s = (frame.len() * iters) as f64 / elapsed.as_secs_f64() / 1e9;
+        std::hint::black_box(idrs);
+        println!(
+            "BENCH scan_frame: 4000x128KB={:.3}ms ({gb_s:.2} GB/s)",
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 }

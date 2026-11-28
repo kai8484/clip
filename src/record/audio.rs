@@ -44,21 +44,55 @@ pub struct Audio {
     pub source: Source,
     pub device_id: String,
     shared: Arc<Shared>,
+    /// Owned by the poller so draining never frees the batch the reader thread keeps reusing.
+    drain: PacketBatch,
 }
 
 /// Shared state between `Audio` and its reader thread.
 #[derive(Default)]
 struct Shared {
     /// Packets queued for the recorder thread, plus any fatal read error.
-    read: Mutex<(Vec<Packet>, Option<anyhow::Error>)>,
+    read: Mutex<(PacketBatch, Option<anyhow::Error>)>,
     stop: AtomicBool,
 }
 
-/// WASAPI packet already downmixed to stereo (`None` = silence), with QPC timestamp (0 if absent).
-struct Packet {
+/// One packet's place in `PacketBatch::samples`, with QPC timestamp (0 if absent).
+/// `len == 0` marks a silent packet, which stores no samples.
+struct PacketMeta {
     qpc: i64,
     frames: usize,
-    stereo: Option<Vec<i16>>,
+    offset: usize,
+    len: usize,
+}
+
+/// Flat, reusable batch of downmixed packets: `meta` indexes `samples`.
+/// Both `Vec`s keep their capacity across drains so the 10 ms reader never reallocates.
+#[derive(Default)]
+struct PacketBatch {
+    meta: Vec<PacketMeta>,
+    samples: Vec<i16>,
+}
+
+impl PacketBatch {
+    fn clear(&mut self) {
+        self.meta.clear();
+        self.samples.clear();
+        // A stall can queue seconds of audio; don't keep that peak allocation forever.
+        if self.samples.capacity() > RATE as usize * 8 {
+            self.samples.shrink_to(RATE as usize * 2);
+        }
+    }
+
+    /// Moves every packet of `other` to the end of `self`, leaving `other` empty but allocated.
+    fn append_from(&mut self, other: &mut PacketBatch) {
+        let base = self.samples.len();
+        self.meta.extend(other.meta.drain(..).map(|mut p| {
+            p.offset += base;
+            p
+        }));
+        self.samples.extend_from_slice(&other.samples);
+        other.samples.clear();
+    }
 }
 
 /// WASAPI client handle. Opened on the recording thread (MTA COM, matching the reader thread)
@@ -122,13 +156,13 @@ impl Audio {
             let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             // Mostly sleeps on events and downmixes small buffers; high priority keeps wakeups timely under load.
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-            let mut got = Vec::new();
+            let mut got = PacketBatch::default();
             while !s.stop.load(Ordering::Relaxed) {
                 // Bounded wait: per-process loopback emits no events when the process is silent.
                 WaitForSingleObject(client.event, 100);
                 let r = client.read(&mut got);
                 let mut read = s.read.lock().unwrap();
-                read.0.append(&mut got);
+                read.0.append_from(&mut got);
                 if let Err(e) = r {
                     read.1 = Some(e);
                     break;
@@ -139,19 +173,23 @@ impl Audio {
                 CoUninitialize();
             }
         })?;
-        Ok(Self { source, device_id, shared })
+        Ok(Self { source, device_id, shared, drain: PacketBatch::default() })
     }
 
     /// Drains queued packets into `buf`, aligned on the timeline via their QPC timestamps.
     pub fn poll(&mut self, buf: &mut AudioBuf, t0: i64) -> Result<()> {
-        let (got, err) = {
+        let err = {
             let mut read = self.shared.read.lock().unwrap();
-            (std::mem::take(&mut read.0), read.1.take())
+            // Swap instead of take: the reader thread gets its buffers back and keeps their capacity.
+            std::mem::swap(&mut self.drain, &mut read.0);
+            read.1.take()
         };
-        for p in got {
+        for p in &self.drain.meta {
             let pos = if p.qpc != 0 { frames_at(p.qpc - t0) } else { buf.end() };
-            buf.push_at(pos, p.stereo.as_deref(), p.frames);
+            let samples = (p.len > 0).then(|| &self.drain.samples[p.offset..p.offset + p.len]);
+            buf.push_at(pos, samples, p.frames);
         }
+        self.drain.clear();
         err.map_or(Ok(()), Err)
     }
 }
@@ -227,32 +265,67 @@ impl Client {
     }
 
     /// Appends all currently available packets (downmixed to stereo) to `got`.
-    unsafe fn read(&self, got: &mut Vec<Packet>) -> Result<()> {
+    unsafe fn read(&self, got: &mut PacketBatch) -> Result<()> {
         while self.cap.GetNextPacketSize()? != 0 {
             let mut data = std::ptr::null_mut();
             let mut frames = 0u32;
             let mut flags = 0u32;
             let mut qpc = 0u64;
             self.cap.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
-            let stereo = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null()).then(|| {
+            let offset = got.samples.len();
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
                 let ch = self.downmix.len();
                 let src = std::slice::from_raw_parts(data as *const f32, frames as usize * ch);
-                let mut out = Vec::with_capacity(frames as usize * 2);
-                for f in src.chunks_exact(ch) {
-                    let (mut l, mut r) = (0.0f32, 0.0f32);
-                    for (x, (gl, gr)) in f.iter().zip(&self.downmix) {
-                        l += x * gl;
-                        r += x * gr;
-                    }
-                    out.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    out.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
-                }
-                out
-            });
+                downmix_to_stereo(src, &self.downmix, &mut got.samples);
+            }
+            let len = got.samples.len() - offset;
             self.cap.ReleaseBuffer(frames)?;
-            got.push(Packet { qpc: qpc as i64, frames: frames as usize, stereo });
+            got.meta.push(PacketMeta { qpc: qpc as i64, frames: frames as usize, offset, len });
         }
         Ok(())
+    }
+}
+
+/// Clamps to full scale and converts to `i16`.
+#[inline]
+fn to_i16(x: f32) -> i16 {
+    (x.clamp(-1.0, 1.0) * 32767.0) as i16
+}
+
+/// Downmixes interleaved `src` (native channel layout, `downmix.len()` channels per frame)
+/// to stereo, appending interleaved `i16` pairs to `out`.
+fn downmix_to_stereo(src: &[f32], downmix: &[(f32, f32)], out: &mut Vec<i16>) {
+    // Studio stereo and mono are the common cases; skip the per-sample gain loop for them.
+    if downmix == [(1.0f32, 0.0f32), (0.0, 1.0)] {
+        out.reserve(src.len());
+        for &[l, r] in src.as_chunks::<2>().0 {
+            out.push(to_i16(l));
+            out.push(to_i16(r));
+        }
+        return;
+    }
+    if downmix == [(1.0f32, 1.0f32)] {
+        out.reserve(src.len() * 2);
+        for &x in src {
+            let s = to_i16(x);
+            out.push(s);
+            out.push(s);
+        }
+        return;
+    }
+    let ch = downmix.len();
+    if ch == 0 {
+        return;
+    }
+    out.reserve(src.len() / ch * 2);
+    for f in src.chunks_exact(ch) {
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for (x, (gl, gr)) in f.iter().zip(downmix) {
+            l += x * gl;
+            r += x * gr;
+        }
+        out.push(to_i16(l));
+        out.push(to_i16(r));
     }
 }
 
@@ -344,13 +417,25 @@ unsafe fn device_id(dev: &IMMDevice) -> String {
 }
 
 /// Active capture devices: `(id, friendly_name)`.
+/// Initializes MTA COM on the calling thread, so any worker can call this without `Mf::init()`.
 pub fn capture_devices() -> Vec<(String, String)> {
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::System::Com::STGM_READ;
     let mut v = Vec::new();
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
     unsafe {
-        let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return v };
-        let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return v };
+        let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            if com {
+                CoUninitialize();
+            }
+            return v;
+        };
+        let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+            if com {
+                CoUninitialize();
+            }
+            return v;
+        };
         for i in 0..col.GetCount().unwrap_or(0) {
             let Ok(dev) = col.Item(i) else { continue };
             let id = device_id(&dev);
@@ -362,6 +447,9 @@ pub fn capture_devices() -> Vec<(String, String)> {
             v.push((id, name));
         }
     }
+    if com {
+        unsafe { CoUninitialize() };
+    }
     v
 }
 
@@ -370,62 +458,308 @@ pub fn current_default_id() -> String {
     unsafe { default_device().map(|d| device_id(&d)).unwrap_or_default() }
 }
 
-/// Ring buffer of interleaved stereo PCM. `start` = frame index (from `t0`) of `data[0]`.
+/// Frames per immutable block: 0.5 s at 48 kHz.
+const BLOCK_FRAMES: usize = RATE as usize / 2;
+
+/// Immutable run of interleaved stereo PCM. `start` = frame index (from `t0`) of `samples[0]`.
+/// Blocks are shared with snapshots by `Arc` clone, so saving never copies the clip.
+#[derive(Clone)]
+pub struct AudioBlock {
+    pub start: i64,
+    pub samples: Arc<[i16]>,
+}
+
+/// Timestamped audio ring: sealed `blocks` plus a mutable `tail` (`tail_start` = its frame index).
+/// Silence and QPC gaps store no samples at all — the gap is simply absent from the timeline.
 #[derive(Default)]
 pub struct AudioBuf {
-    pub start: i64,
-    pub data: VecDeque<i16>,
+    blocks: VecDeque<AudioBlock>,
+    tail_start: i64,
+    tail: Vec<i16>,
+    /// Frame index one past the last captured frame (gaps included), i.e. the timeline position.
+    end_frame: i64,
 }
 
 impl AudioBuf {
     pub fn end(&self) -> i64 {
-        self.start + (self.data.len() / 2) as i64
+        self.end_frame
     }
 
+    /// Appends one WASAPI packet or silence marker at timeline position `pos`.
     pub fn push_at(&mut self, pos: i64, samples: Option<&[i16]>, frames: usize) {
-        if self.data.is_empty() {
-            self.start = pos;
+        // Floor of the history: a gap only becomes silence once real audio is dropped for it.
+        // `end_frame` tracks `max(pos + frames)`, so blocks/tail can start anywhere in the ring.
+        if self.blocks.is_empty() && self.tail.is_empty() && self.end_frame == 0 {
+            self.tail_start = pos;
+            self.end_frame = pos;
         }
-        let end = self.end();
         let mut skip = 0usize;
-        if pos > end + RATE / 100 {
-            // Silence gap: pad zeros to preserve A/V sync.
-            let gap = (pos - end) as usize;
-            self.data.extend(std::iter::repeat_n(0, gap * 2));
-        } else if pos < end - RATE / 50 {
+        if pos < self.end_frame - RATE / 50 {
             // Overlapping frames: drop the already-buffered prefix.
-            skip = ((end - pos) as usize).min(frames);
+            skip = ((self.end_frame - pos) as usize).min(frames);
+        } else if pos > self.end_frame + RATE / 100 {
+            // Silence or sleep/QPC gap: seal what we have and store no zeros for the hole.
+            self.flush_tail();
         }
-        match samples {
-            Some(s) => self.data.extend(s[skip * 2..].iter().copied()),
-            None => self.data.extend(std::iter::repeat_n(0, (frames - skip) * 2)),
+        if let Some(s) = samples {
+            let slice = s.get(skip * 2..).unwrap_or(&[]);
+            if !slice.is_empty() {
+                let at = pos + skip as i64;
+                // Keep `tail` contiguous; a small discontinuity starts a new block.
+                if !self.tail.is_empty() && at != self.tail_start + (self.tail.len() / 2) as i64 {
+                    self.flush_tail();
+                }
+                if self.tail.is_empty() {
+                    self.tail_start = at;
+                }
+                self.tail.extend_from_slice(slice);
+                while self.tail.len() >= BLOCK_FRAMES * 2 {
+                    let rest = self.tail.split_off(BLOCK_FRAMES * 2);
+                    let sealed = std::mem::replace(&mut self.tail, rest);
+                    self.blocks.push_back(AudioBlock { start: self.tail_start, samples: Arc::from(sealed) });
+                    self.tail_start += BLOCK_FRAMES as i64;
+                }
+            }
         }
+        // `None` stores nothing: the gap stays absent and the timeline below still advances.
+        self.end_frame = self.end_frame.max(pos + frames as i64);
+    }
+
+    /// Seals the mutable tail into an immutable block.
+    fn flush_tail(&mut self) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let sealed = std::mem::take(&mut self.tail);
+        self.blocks.push_back(AudioBlock { start: self.tail_start, samples: Arc::from(sealed) });
     }
 
     pub fn trim_before(&mut self, frame: i64) {
-        if frame > self.start {
-            let n = ((frame - self.start) as usize).min(self.data.len() / 2);
-            self.data.drain(..n * 2);
-            self.start += n as i64;
+        while self.blocks.front().is_some_and(|b| b.start + (b.samples.len() / 2) as i64 <= frame) {
+            self.blocks.pop_front();
+        }
+        if !self.tail.is_empty() && self.tail_start + (self.tail.len() / 2) as i64 <= frame {
+            self.tail.clear();
+        }
+        // A sleep gap can drop thousands of blocks at once; don't keep the peak capacity.
+        if self.blocks.capacity() > 64 && self.blocks.len() * 4 < self.blocks.capacity() {
+            self.blocks.shrink_to_fit();
         }
     }
 
-    /// Accumulates audio starting at `from` into `out` (interleaved stereo), scaled by `gain`,
-    /// reading across both halves of the ring buffer.
-    #[inline(never)] // called per chunk; inlining across call sites bloats the exe by ~3 KB for no gain
-    pub fn mix_into(&self, out: &mut [f32], from: i64, gain: f32) {
-        let skip = (((self.start - from).max(0) * 2) as usize).min(out.len());
-        let mut out = &mut out[skip..];
-        let mut first = ((from - self.start).max(0) * 2) as usize;
-        let (a, b) = self.data.as_slices();
-        for part in [a, b] {
-            let src = part.get(first..).unwrap_or(&[]);
-            first = first.saturating_sub(part.len());
-            let n = src.len().min(out.len());
-            for (o, &s) in out[..n].iter_mut().zip(src) {
-                *o += s as f32 * gain;
-            }
-            out = &mut std::mem::take(&mut out)[n..];
+    /// Blocks overlapping the window at or after frame `from`, shared by `Arc` clone (no copy).
+    pub fn snapshot_blocks(&self, from: i64) -> Vec<AudioBlock> {
+        let mut v: Vec<AudioBlock> = self
+            .blocks
+            .iter()
+            .filter(|b| b.start + (b.samples.len() / 2) as i64 > from)
+            .cloned()
+            .collect();
+        if !self.tail.is_empty() && self.tail_start + (self.tail.len() / 2) as i64 > from {
+            v.push(AudioBlock { start: self.tail_start, samples: Arc::from(self.tail.as_slice()) });
         }
+        v
+    }
+
+    /// All buffered samples in timeline order (diagnostics only).
+    pub fn samples(&self) -> impl Iterator<Item = i16> + '_ {
+        self.blocks.iter().flat_map(|b| b.samples.iter().copied()).chain(self.tail.iter().copied())
+    }
+
+    /// Accumulates audio starting at `from` into `out` (interleaved stereo), scaled by `gain`.
+    pub fn mix_into(&self, out: &mut [f32], from: i64, gain: f32) {
+        for b in &self.blocks {
+            mix_slice(out, b.start, &b.samples, from, gain);
+        }
+        if !self.tail.is_empty() {
+            mix_slice(out, self.tail_start, &self.tail, from, gain);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_heap_bytes(&self) -> (usize, usize) {
+        let elem = std::mem::size_of::<i16>();
+        let stored: usize = self.blocks.iter().map(|b| b.samples.len() * elem).sum();
+        let cap = stored + self.tail.capacity() * elem + self.blocks.capacity() * std::mem::size_of::<AudioBlock>();
+        (stored + self.tail.len() * elem, cap)
+    }
+}
+
+/// Adds `samples` (interleaved stereo, starting at frame `start`) into `out`, which starts at
+/// frame `from`. Shared by the live ring and by snapshots so both mix identically.
+#[inline(never)] // called per chunk; inlining across call sites bloats the exe by ~3 KB for no gain
+pub fn mix_slice(out: &mut [f32], start: i64, samples: &[i16], from: i64, gain: f32) {
+    let skip = (((start - from).max(0) * 2) as usize).min(out.len());
+    let out = &mut out[skip..];
+    let first = ((from - start).max(0) * 2) as usize;
+    let Some(src) = samples.get(first..) else { return };
+    for (o, &s) in out.iter_mut().zip(src) {
+        *o += s as f32 * gain;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_audio_buf() {
+        let mut buf = AudioBuf::default();
+        let t0 = std::time::Instant::now();
+        // 60s of silent 48kHz stereo packets (100 packets/s)
+        for i in 0..6_000i64 {
+            buf.push_at(i * 480, None, 480);
+        }
+        // Simulate a 10-minute sleep/hibernate QPC jump followed by one active packet
+        let active = vec![1200i16; 480 * 2];
+        buf.push_at(6_000 * 480 + 48_000 * 600, Some(&active), 480);
+        let push_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        buf.trim_before(6_000 * 480 + 48_000 * 570);
+        let trim_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let (used_b, cap_b) = buf.debug_heap_bytes();
+        let t2 = std::time::Instant::now();
+        let snap = buf.snapshot_blocks(6_000 * 480 + 48_000 * 570);
+        let snap_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(snap);
+
+        println!(
+            "BENCH audio_buf: push={push_ms:.3}ms trim={trim_ms:.3}ms snapshot={snap_ms:.3}ms used={:.2}MB cap={:.2}MB",
+            used_b as f64 / (1024.0 * 1024.0),
+            cap_b as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn downmix_stereo_identity() {
+        let mut out = Vec::new();
+        downmix_to_stereo(&[0.5, -0.5, 1.5, 1.0], &[(1.0, 0.0), (0.0, 1.0)], &mut out);
+        assert_eq!(out, vec![16383, -16383, 32767, 32767]);
+    }
+
+    #[test]
+    fn downmix_mono_duplicates() {
+        let mut out = Vec::new();
+        downmix_to_stereo(&[0.25, -1.0], &[(1.0, 1.0)], &mut out);
+        assert_eq!(out, vec![8191, 8191, -32767, -32767]);
+    }
+
+    #[test]
+    fn downmix_surround_matches_reference() {
+        // 5.1 layout: FL, FR, FC, LFE, BL, BR.
+        let weights = downmix(6, 0x3f);
+        assert_ne!(weights, [(1.0, 0.0), (0.0, 1.0)], "must take the general path");
+        let src: Vec<f32> = (0..6 * 4).map(|i| (i as f32 * 0.1).sin() * 0.4).collect();
+        let mut out = Vec::new();
+        downmix_to_stereo(&src, &weights, &mut out);
+
+        let mut want = Vec::new();
+        for f in src.chunks_exact(6) {
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for (x, (gl, gr)) in f.iter().zip(&weights) {
+                l += x * gl;
+                r += x * gr;
+            }
+            want.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
+            want.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
+        }
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn packet_batch_append_keeps_offsets() {
+        let mut a = PacketBatch::default();
+        a.samples.extend_from_slice(&[1, 2, 3, 4]);
+        a.meta.push(PacketMeta { qpc: 1, frames: 2, offset: 0, len: 4 });
+
+        let mut b = PacketBatch::default();
+        b.samples.extend_from_slice(&[5, 6]);
+        b.samples.extend_from_slice(&[7, 8, 9, 10]);
+        b.meta.push(PacketMeta { qpc: 2, frames: 1, offset: 0, len: 2 });
+        b.meta.push(PacketMeta { qpc: 3, frames: 2, offset: 2, len: 4 });
+        b.meta.push(PacketMeta { qpc: 4, frames: 2, offset: 6, len: 0 });
+        let cap = b.samples.capacity();
+
+        a.append_from(&mut b);
+        assert!(b.meta.is_empty() && b.samples.is_empty(), "source batch is emptied");
+        assert_eq!(b.samples.capacity(), cap, "source keeps its allocation");
+
+        let got: Vec<(i64, i64, usize)> = a
+            .meta
+            .iter()
+            .map(|p| (p.qpc, p.offset as i64, p.len))
+            .collect();
+        assert_eq!(got, vec![(1, 0, 4), (2, 4, 2), (3, 6, 4), (4, 10, 0)]);
+        for p in &a.meta {
+            if p.len > 0 {
+                assert_eq!(p.frames * 2, p.len, "non-silent packet stores 2 samples per frame");
+            }
+        }
+        assert_eq!(&a.samples[4..6], &[5, 6]);
+        assert_eq!(&a.samples[6..10], &[7, 8, 9, 10]);
+
+        a.clear();
+        assert!(a.meta.is_empty() && a.samples.is_empty());
+        assert!(a.samples.capacity() >= 10, "clear keeps capacity");
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_audio_downmix() {
+        let src: Vec<f32> = (0..480 * 2).map(|i| ((i as f32) * 0.01).sin() * 0.5).collect();
+        let mut out = Vec::new();
+        let t = std::time::Instant::now();
+        for _ in 0..10_000 {
+            out.clear();
+            downmix_to_stereo(&src, &[(1.0, 0.0), (0.0, 1.0)], &mut out);
+        }
+        std::hint::black_box(&out);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("BENCH audio_downmix: 10_000 x 480 stereo frames in {ms:.3}ms");
+    }
+
+    #[test]
+    fn silent_packets_and_gaps_store_no_samples() {
+        let mut buf = AudioBuf::default();
+        let pcm = vec![1000i16; 480 * 2];
+        buf.push_at(0, Some(&pcm), 480);
+        buf.push_at(480, None, 480); // silent WASAPI packet
+        let jump = 48_000 * 60; // 1-minute sleep/QPC jump
+        buf.push_at(960 + jump, Some(&pcm), 480);
+
+        let stored = 480 * 2 * 2 * std::mem::size_of::<i16>(); // the two real packets only
+        assert_eq!(buf.debug_heap_bytes().0, stored, "no zero padding for silence or gaps");
+        assert_eq!(buf.end(), 960 + jump + 480, "timeline still advances across the gap");
+    }
+
+    #[test]
+    fn gaps_keep_av_sync_in_mix_into() {
+        let mut buf = AudioBuf::default();
+        let pcm = vec![1000i16; 480 * 2];
+        buf.push_at(480, Some(&pcm), 480);
+        buf.push_at(960, None, 480);
+        let jump = 48_000 * 60;
+        let late = 960 + jump;
+        buf.push_at(late, Some(&pcm), 480);
+
+        // The packet after the gap must still land at its own timestamp, unmuted and unshifted.
+        let mut out = vec![0f32; 480 * 2];
+        buf.mix_into(&mut out, late, 1.0);
+        assert!(out.iter().all(|&x| x == 1000.0));
+
+        // The silent packet and the omitted gap mix as silence, not as stale audio.
+        let mut hole = vec![0f32; 480 * 2];
+        buf.mix_into(&mut hole, 960, 1.0);
+        assert!(hole.iter().all(|&x| x == 0.0));
+
+        // The snapshot keeps the late packet too (gap omitted, not padded).
+        let mut snap = vec![0f32; 480 * 2];
+        for b in buf.snapshot_blocks(late) {
+            mix_slice(&mut snap, b.start, &b.samples, late, 1.0);
+        }
+        assert_eq!(snap, out);
     }
 }

@@ -12,7 +12,7 @@ use anyhow::Result;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
 
-use super::audio::{self, Audio, AudioBuf, Source};
+use super::audio::{self, Audio, AudioBlock, AudioBuf, Source};
 use super::capture::{Aim, Capture};
 use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
@@ -119,7 +119,6 @@ fn wait_for_game(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify) -> std::
 }
 
 fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
-    let _mf = Mf::init();
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
@@ -267,6 +266,8 @@ fn scaled_size(src_w: u32, src_h: u32, max_h: u32) -> (u32, u32) {
 
 /// `restarted`: game monitor that triggered a restart (already opened at its resolution).
 fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>) -> Result<End> {
+    // Held for the session only: Media Foundation (and its thread pool) is idle while waiting for a game.
+    let _mf = Mf::init();
     let fps = cfg.fps.max(1);
     let frame_dur = 10_000_000i64 / fps as i64;
 
@@ -349,7 +350,12 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
                 }
             }
         }
-        cap.poll(now)?;
+        // Alt-tabbed in "Games only" mode: the frame would be replaced by black anyway, so skip
+        // `AcquireNextFrame`/`CopyResource` and let the GPU go idle.
+        let visible = cfg.capture_mode == CaptureMode::Screen || au.game.visible();
+        if conv.is_none() || visible {
+            cap.poll(now)?;
+        }
         if let Some(f) = &cap.latest {
             if !conv.as_ref().is_some_and(|c| c.is_for(f)) {
                 conv = Some(Converter::new(&cap.device, &cap.context, f, w, h, fps, 8)?);
@@ -357,6 +363,11 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
             }
         }
         au.sync(cfg, now);
+        // Trim before polling so a long silence/sleep gap (thousands of blocks) is dropped on arrival.
+        let a_min = frames_at(now - keep - 20_000_000);
+        au.game_ch.buf.trim_before(a_min);
+        au.desktop.buf.trim_before(a_min);
+        au.mic.buf.trim_before(a_min);
         au.game_ch.poll(t0);
         au.desktop.poll(t0);
         au.mic.poll(t0);
@@ -366,11 +377,10 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
 
         if now >= next_frame {
             let pts = (now / frame_dur) * frame_dur;
-            let visible = cfg.capture_mode == CaptureMode::Screen || au.game.visible();
             if let Some(c) = conv.as_mut() {
                 // Only convert if the encoder requested input; skip frame if encoder is busy.
                 if enc.pending_input > 0 {
-                    let tex = if visible { c.convert(cap.frame_seq)? } else { c.black() };
+                    let tex = if visible { c.convert(cap.frame_seq)? } else { c.black()? };
                     if visible && probe_at.is_some_and(|t| now >= t) {
                         probe_at = None;
                         log(&c.probe(&tex));
@@ -382,10 +392,6 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
         }
 
         trim_video(&mut packets, now - keep);
-        let a_min = frames_at(now - keep - 20_000_000);
-        au.game_ch.buf.trim_before(a_min);
-        au.desktop.buf.trim_before(a_min);
-        au.mic.buf.trim_before(a_min);
         au.masks.retain(|m| m.1 > now - keep - 20_000_000);
 
         timer.sleep(next_frame - (now_100ns() - t0));
@@ -423,41 +429,23 @@ impl MixSettings {
     }
 }
 
-/// Contiguous copy of an `AudioBuf` window, so mixing on the mux thread never touches the live
-/// ring buffer that the capture thread keeps writing to.
+/// Snapshot of an `AudioBuf` window: `Arc` clones of the live blocks, so mixing on the mux thread
+/// never touches the ring buffer the capture thread keeps writing to, and nothing is copied.
 struct AudioWindow {
-    /// Frame index (from `t0`) of `data[0]`.
-    start: i64,
-    data: Vec<i16>,
+    /// Blocks overlapping the window, in timeline order.
+    blocks: Vec<AudioBlock>,
 }
 
 impl AudioWindow {
-    /// Copies the part of `buf` at or after frame `from`.
+    /// Shares the part of `buf` at or after frame `from`.
     fn snapshot(buf: &AudioBuf, from: i64) -> Self {
-        let total = buf.data.len() / 2;
-        let skip = ((from - buf.start).max(0) as usize).min(total);
-        let mut data = Vec::with_capacity((total - skip) * 2);
-        let mut drop_frames = skip;
-        let (a, b) = buf.data.as_slices();
-        for part in [a, b] {
-            if drop_frames * 2 >= part.len() {
-                drop_frames -= part.len() / 2;
-                continue;
-            }
-            data.extend_from_slice(&part[drop_frames * 2..]);
-            drop_frames = 0;
-        }
-        Self { start: buf.start + skip as i64, data }
+        Self { blocks: buf.snapshot_blocks(from) }
     }
 
-    /// Same contract as `AudioBuf::mix_into`, reading the snapshot instead of the live ring.
+    /// Same contract as `AudioBuf::mix_into`, mixing the snapshot instead of the live ring.
     fn mix_into(&self, out: &mut [f32], from: i64, gain: f32) {
-        let skip = (((self.start - from).max(0) * 2) as usize).min(out.len());
-        let out = &mut out[skip..];
-        let first = ((from - self.start).max(0) * 2) as usize;
-        let Some(src) = self.data.get(first..) else { return };
-        for (o, &s) in out.iter_mut().zip(src) {
-            *o += s as f32 * gain;
+        for b in &self.blocks {
+            audio::mix_slice(out, b.start, &b.samples, from, gain);
         }
     }
 }
@@ -779,14 +767,13 @@ mod tests {
     #[test]
     fn audio_window_snapshot_matches_the_ring_buffer() {
         let mut buf = AudioBuf::default();
-        let frames = 10_000usize;
+        let frames = 70_000usize; // spans several 0.5 s blocks plus a tail
         let pcm: Vec<i16> = (0..frames * 2).map(|i| i as i16).collect();
         buf.push_at(100, Some(&pcm), frames);
 
         let from = 1_234;
         let snap = AudioWindow::snapshot(&buf, from);
-        assert_eq!(snap.start, from);
-        assert_eq!(snap.data.len(), (frames as i64 - from + 100) as usize * 2);
+        assert!(!snap.blocks.is_empty());
 
         let mut want = vec![0f32; 32];
         let mut got = vec![0f32; 32];
@@ -796,6 +783,6 @@ mod tests {
 
         // A window starting after the buffer's end is empty, not a panic.
         let snap = AudioWindow::snapshot(&buf, 999_999);
-        assert!(snap.data.is_empty());
+        assert!(snap.blocks.is_empty());
     }
 }

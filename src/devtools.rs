@@ -168,8 +168,8 @@ fn test_mic() -> i32 {
                     std::thread::sleep(Duration::from_millis(50));
                     let _ = a.poll(&mut buf, t0);
                 }
-                let peak = buf.data.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                println!("{name}: {} samples, peak {peak}", buf.data.len() / 2);
+                let peak = buf.samples().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                println!("{name}: {} samples, peak {peak}", buf.samples().count() / 2);
             }
             Err(e) => println!("{name}: error {e}"),
         }

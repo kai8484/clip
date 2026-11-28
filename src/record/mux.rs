@@ -26,19 +26,25 @@ pub fn write(job: Job) -> Result<PathBuf> {
     let mf = Mf::init();
     let r = write_inner(&job);
     drop(mf);
+    // The clip's video GOPs and PCM audio are no longer needed; free them before rewriting the
+    // file so faststart's copy does not contend with them for RAM.
+    let path = job.path;
+    drop(job.video_type);
+    drop(job.packets);
+    drop(job.audio);
     if let Err(e) = r {
         // Removes the placeholder claimed by the save thread, so no empty clip is left behind.
-        let _ = std::fs::remove_file(&job.path);
+        let _ = std::fs::remove_file(&path);
         return Err(e);
     }
     // Faststart is best-effort: the muxed file is already valid, so a failure only costs an
     // initial seek on players that can't read a trailing `moov`.
-    match faststart(&job.path) {
+    match faststart(&path) {
         Ok(true) => log("clip: moved moov before mdat (faststart)"),
         Ok(false) => {}
         Err(e) => log(&format!("clip left non-faststart: {e:?}")),
     }
-    Ok(job.path)
+    Ok(path)
 }
 
 fn write_inner(job: &Job) -> Result<()> {
@@ -183,6 +189,8 @@ fn faststart(path: &Path) -> Result<bool> {
     patch_chunk_offsets(&mut moov_payload, &boxes, &starts, 0)?;
 
     let (tmp, mut out) = temp_sibling(path)?;
+    // One reused staging buffer: io::copy's 8 KB default costs thousands of syscall pairs per clip.
+    let mut buf = vec![0u8; 512 * 1024];
     let rewrite = (|| -> Result<()> {
         for &i in &order {
             let b = &boxes[i];
@@ -191,7 +199,7 @@ fn faststart(path: &Path) -> Result<bool> {
                 out.write_all(&moov_payload)?;
             } else {
                 src.seek(SeekFrom::Start(b.start))?;
-                io::copy(&mut (&mut src).take(b.size), &mut out)?;
+                copy_exact(&mut src, &mut out, b.size, &mut buf)?;
             }
         }
         out.flush()?;
@@ -250,6 +258,29 @@ fn read_boxes(f: &mut File, len: u64) -> io::Result<Vec<TopBox>> {
         pos += size;
     }
     Ok(boxes)
+}
+
+/// Copies exactly `rem` bytes from `src` to `out` through `buf` in chunks of up to `buf.len()`.
+fn copy_exact(src: &mut File, out: &mut File, rem: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut rem = rem;
+    while rem > 0 {
+        let want = rem.min(buf.len() as u64) as usize;
+        match src.read(&mut buf[..want]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MP4 box ends before its declared size",
+                ))
+            }
+            Ok(n) => {
+                out.write_all(&buf[..n])?;
+                rem -= n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn write_box_header(out: &mut File, kind: &[u8; 4], size: u64, header: u64) -> io::Result<()> {
@@ -542,5 +573,35 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() > 1_000, "clip must hold real data");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_faststart() {
+        let dir = temp_dir("bench");
+        let path = dir.join("bench_32mb.mp4");
+        let ftyp = mp4_box(b"ftyp", b"isomisom");
+        let payload_len = 32usize * 1024 * 1024;
+        let mut mdat_hdr = Vec::with_capacity(8);
+        mdat_hdr.extend_from_slice(&((8 + payload_len) as u32).to_be_bytes());
+        mdat_hdr.extend_from_slice(b"mdat");
+        let offset = (ftyp.len() + 8) as u64;
+        let moov = sample_moov(offset, false);
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&ftyp).unwrap();
+            f.write_all(&mdat_hdr).unwrap();
+            let chunk = vec![0xA5u8; 1024 * 1024];
+            for _ in 0..32 {
+                f.write_all(&chunk).unwrap();
+            }
+            f.write_all(&moov).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        let moved = faststart(&path).unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(moved);
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("BENCH mux_faststart: 32MB={ms:.3}ms");
     }
 }

@@ -30,6 +30,9 @@ const NOT_GAMES: &[&str] = &[
     "clip",
 ];
 
+/// Window classes of desktop and taskbar windows, which never count as games.
+const SHELL_CLASSES: &[&str] = &["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+
 const FS_EVERY: i64 = 2_500_000; // 250 ms
 const ALIVE_EVERY: i64 = 30_000_000; // 3 s
 const STILL_ACTIVE: u32 = 259;
@@ -158,9 +161,15 @@ fn foreground() -> Option<HWND> {
         }
         let mut cls = [0u16; 64];
         let n = GetClassNameW(h, &mut cls).max(0) as usize;
-        let cls = String::from_utf16_lossy(&cls[..n]);
-        (!matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(h)
+        let cls = &cls[..n];
+        (!SHELL_CLASSES.iter().any(|c| eq_utf16(cls, c))).then_some(h)
     }
+}
+
+/// Compares a UTF-16 slice against an ASCII literal without allocating.
+fn eq_utf16(slice: &[u16], ascii: &str) -> bool {
+    let bytes = ascii.as_bytes();
+    slice.len() == bytes.len() && slice.iter().zip(bytes).all(|(&u, &b)| u == b as u16)
 }
 
 fn is_game(exe: &str) -> bool {
@@ -179,7 +188,7 @@ fn open(pid: u32, window: HWND) -> Option<Proc> {
             String::from_utf16_lossy(&buf[..len as usize])
         } else {
             // Some anti-cheats block OpenProcess; fall back to the process snapshot name.
-            snapshot().into_iter().find(|(p, _)| *p == pid).map(|(_, n)| n)?
+            process_name(pid)?
         };
         Some(Proc { pid, exe: exe_stem(&path), handle, window })
     }
@@ -196,30 +205,68 @@ fn exe_stem(path: &str) -> String {
 
 fn alive(p: &Proc) -> bool {
     if p.handle.is_invalid() {
-        return snapshot().iter().any(|(pid, _)| *pid == p.pid);
+        // Anti-cheat blocked OpenProcess: the cached window is a cheaper proof of life
+        // than walking the whole process list every 3 s.
+        if !p.window.is_invalid() {
+            let mut wpid = 0u32;
+            unsafe {
+                if IsWindow(p.window).as_bool() {
+                    GetWindowThreadProcessId(p.window, Some(&mut wpid));
+                }
+            }
+            if wpid == p.pid {
+                return true;
+            }
+        }
+        return pid_exists(p.pid);
     }
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(p.handle, &mut code).is_ok() && code == STILL_ACTIVE }
 }
 
-/// Returns `(pid, exe_name)` for all running processes.
-fn snapshot() -> Vec<(u32, String)> {
-    let mut v = Vec::new();
+/// True if a process with `pid` exists. Scans the process list without allocating.
+fn pid_exists(pid: u32) -> bool {
     unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return v };
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return false };
         let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = false;
         if Process32FirstW(snap, &mut e).is_ok() {
             loop {
-                let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-                v.push((e.th32ProcessID, String::from_utf16_lossy(&e.szExeFile[..n])));
+                if e.th32ProcessID == pid {
+                    found = true;
+                    break;
+                }
                 if Process32NextW(snap, &mut e).is_err() {
                     break;
                 }
             }
         }
         let _ = CloseHandle(snap);
+        found
     }
-    v
+}
+
+/// Executable name of `pid`, allocating only for the matching entry.
+fn process_name(pid: u32) -> Option<String> {
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut name = None;
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                if e.th32ProcessID == pid {
+                    let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                    name = Some(String::from_utf16_lossy(&e.szExeFile[..n]));
+                    break;
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        name
+    }
 }
 
 /// Returns `(PID, window)` if the foreground window covers its entire monitor.
@@ -246,5 +293,85 @@ fn fullscreen_window() -> Option<(u32, HWND)> {
         let mut pid = 0u32;
         GetWindowThreadProcessId(h, Some(&mut pid));
         (pid != 0).then_some((pid, h))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eq_utf16_matches_ascii() {
+        let cls: Vec<u16> = "Shell_TrayWnd".encode_utf16().collect();
+        assert!(eq_utf16(&cls, "Shell_TrayWnd"));
+        assert!(!eq_utf16(&cls, "Shell_TrayWNd"), "case must matter");
+        assert!(!eq_utf16(&cls, "Shell_TrayWn"), "length must match");
+        assert!(!eq_utf16(&[], "Progman"));
+        assert!(!eq_utf16(&cls, ""));
+    }
+
+    #[test]
+    fn pid_exists_finds_self() {
+        assert!(pid_exists(std::process::id()));
+        assert!(!pid_exists(u32::MAX));
+    }
+
+    #[test]
+    fn process_name_of_self_is_executable() {
+        let name = process_name(std::process::id()).expect("own process must be listed");
+        assert!(name.to_ascii_lowercase().ends_with(".exe"), "unexpected name {name}");
+        assert_eq!(process_name(u32::MAX), None);
+    }
+
+    #[test]
+    fn alive_trusts_window_when_handle_is_invalid() {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_invalid() {
+            return; // no foreground window in this session
+        }
+        let mut wpid = 0u32;
+        unsafe { GetWindowThreadProcessId(fg, Some(&mut wpid)) };
+        if wpid == 0 {
+            return;
+        }
+        let p = Proc { pid: wpid, exe: "test".into(), handle: HANDLE::default(), window: fg };
+        assert!(alive(&p));
+        // A stale window handle for another PID falls through to the process list.
+        let stale = Proc { pid: wpid, exe: "test".into(), handle: HANDLE::default(), window: HWND::default() };
+        assert!(alive(&stale));
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn perf_bench_game_alive_and_fg() {
+        let fg = unsafe { GetForegroundWindow() };
+        let mut pid = std::process::id();
+        if !fg.is_invalid() {
+            let mut wpid = 0u32;
+            unsafe { GetWindowThreadProcessId(fg, Some(&mut wpid)) };
+            if wpid != 0 {
+                pid = wpid;
+            }
+        }
+        let p = Proc { pid, exe: "test".into(), handle: HANDLE::default(), window: fg };
+        let t0 = std::time::Instant::now();
+        let mut ok = 0usize;
+        for _ in 0..20 {
+            if alive(&p) {
+                ok += 1;
+            }
+        }
+        let alive_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let mut fg_hits = 0usize;
+        for _ in 0..500 {
+            if foreground().is_some() {
+                fg_hits += 1;
+            }
+        }
+        let fg_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box((ok, fg_hits));
+        println!("BENCH game: alive_20x={alive_ms:.3}ms foreground_500x={fg_ms:.3}ms");
     }
 }

@@ -12,6 +12,7 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
     WPARAM,
@@ -21,7 +22,10 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_ROUND,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, GetCurrentThreadId, OpenEventW, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE, INFINITE,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
@@ -44,7 +48,6 @@ use clip::app::update;
 use clip::config::{self, CaptureMode, Config, GlobalAction, VideoCodec};
 use clip::library;
 use clip::log::{app_dir, exe_dir, log};
-use clip::mf::Mf;
 use clip::record::audio;
 use clip::record::recorder::{Event, Notify, Recorder};
 use clip::share::{
@@ -59,6 +62,8 @@ use clip::ui_kit::window::{find_own_window, open_folder as open_explorer};
 const WM_HOTKEY_RELOAD: u32 = WM_APP + 1;
 const WM_HOTKEY_SUSPEND: u32 = WM_APP + 2;
 const SUBCLASS_FRAMELESS_ID: usize = 1;
+/// Signalled by a second instance so this one reopens its on-demand window.
+const SHOW_EVENT: PCWSTR = windows::core::w!("Local\\clip.Show");
 
 // On Windows 11, tao leaves a 1 px top inset in WM_NCCALCSIZE for undecorated windows with shadows,
 // causing DWM to draw a gray non-client hairline (#202020). Restore the original top edge when not
@@ -237,6 +242,8 @@ struct CoreState {
     needs_setup: bool,
     /// Raw `Local\clip.Main` mutex handle, released before handing off to the installed copy.
     instance_mutex: Option<usize>,
+    /// Set before `app.exit(0)` so `RunEvent::ExitRequested` stops holding the tray alive.
+    exiting: Arc<AtomicBool>,
     /// In-app update checking: status, HTTP validators and the background checker's wake signal.
     updates: UpdateManagerState,
 }
@@ -370,6 +377,13 @@ struct ThumbMeta {
     width: u32,
     height: u32,
     codec: String,
+    /// `false` when no cover frame could be decoded: the gallery then skips the `thumb` request.
+    #[serde(default = "default_true")]
+    has_thumb: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const THUMB_CACHE_VERSION: u32 = 1;
@@ -579,15 +593,15 @@ impl UploadTracker {
     }
 }
 
-fn encode_png_bytes(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+fn encode_png_bytes(w: u32, h: u32, rgb: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut enc = png::Encoder::new(&mut out, w, h);
-    enc.set_color(png::ColorType::Rgba);
+    enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     // Thumbnails are disposable and re-generated on demand: speed beats a few KB.
     enc.set_compression(png::Compression::Fast);
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(rgba).map_err(|e| e.to_string())?;
+    writer.write_image_data(rgb).map_err(|e| e.to_string())?;
     drop(writer);
     Ok(out)
 }
@@ -644,8 +658,14 @@ fn http_response(status: u16, content_type: &'static str, body: Vec<u8>) -> taur
     if let Ok(value) = tauri::http::HeaderValue::from_str(content_type) {
         res.headers_mut().insert("content-type", value);
     }
+    // Thumbnail URLs carry the clip's mtime, so a hit can be cached for good; errors must not be.
+    let cache = if status == 200 {
+        "private, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     res.headers_mut()
-        .insert("cache-control", tauri::http::HeaderValue::from_static("no-cache"));
+        .insert("cache-control", tauri::http::HeaderValue::from_static(cache));
     res
 }
 
@@ -673,14 +693,20 @@ fn read_clip_thumb(clip: &Path, thumbs: &ThumbStore) -> Result<(Option<Vec<u8>>,
     let (meta_p, png_p) = thumb_cache_paths(clip);
 
     if let Some(cached) = thumbs.cached(clip, size, modified_ms) {
+        if !cached.has_thumb {
+            return Ok((None, cached));
+        }
         if let Ok(bytes) = std::fs::read(&png_p) {
             touch_thumb_if_stale(&png_p);
             return Ok((Some(bytes), cached));
         }
     }
 
-    let _mf = Mf::init();
+    // `probe_and_cover` initializes Media Foundation itself.
     let info = library::probe_and_cover(clip, THUMB_WIDTH)?;
+    let png = info
+        .cover_rgb
+        .and_then(|(w, h, rgb)| encode_png_bytes(w, h, &rgb).ok());
     let cached = ThumbMeta {
         v: THUMB_CACHE_VERSION,
         size,
@@ -689,15 +715,13 @@ fn read_clip_thumb(clip: &Path, thumbs: &ThumbStore) -> Result<(Option<Vec<u8>>,
         width: info.width,
         height: info.height,
         codec: info.codec.to_string(),
+        has_thumb: png.is_some(),
     };
-    let png = info
-        .cover_rgba
-        .and_then(|(w, h, rgba)| encode_png_bytes(w, h, &rgba).ok());
 
+    let _ = std::fs::create_dir_all(thumb_cache_dir());
+    let _ = std::fs::write(&meta_p, serde_json::to_string(&cached).unwrap_or_default());
     if let Some(bytes) = &png {
-        let _ = std::fs::create_dir_all(thumb_cache_dir());
         let _ = std::fs::write(&png_p, bytes);
-        let _ = std::fs::write(&meta_p, serde_json::to_string(&cached).unwrap_or_default());
     }
     thumbs.remember(clip, &cached);
     Ok((png, cached))
@@ -1179,11 +1203,81 @@ fn apply_config(
     emit_config_and_state(app, shared);
 }
 
+/// Frameless chrome, rounded Win11 corners and the Miku dark-slate border. Runs on every
+/// (re)creation of the main window, since the window is destroyed when closed to the tray.
+fn configure_main_window(win: &tauri::WebviewWindow) {
+    let _ = win.set_icon(
+        Image::from_bytes(include_bytes!("../../assets/icon/app64.png"))
+            .unwrap()
+            .to_owned(),
+    );
+    let _ = win.set_background_color(Some(tauri::window::Color(13, 17, 26, 255)));
+    let Ok(raw_hwnd) = win.hwnd() else { return };
+    let hwnd = HWND(raw_hwnd.0);
+    unsafe {
+        apply_window_icons(hwnd);
+        let pref = DWMWCP_ROUND.0 as u32;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&pref as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        // Match Win11 native border color to the Miku dark-slate window chrome
+        // (#223B4A, keyed to the #141926 tile / #0D111A background) to prevent
+        // gray DWM artifacts around the rounded top corners.
+        let border: u32 = 0x004A_3B22;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&border as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = SetWindowSubclass(hwnd, Some(frameless_subclass_proc), SUBCLASS_FRAMELESS_ID, 0);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Builds the `main` webview on demand. Tray-only launches never call this, so no WebView2
+/// process tree, GPU compositor or background DOM refresh exists until the UI is opened.
+fn create_main_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        "main",
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("clip")
+    .inner_size(880.0, 453.0)
+    .min_inner_size(760.0, 240.0)
+    .resizable(false)
+    .maximizable(false)
+    .transparent(false)
+    .decorations(false)
+    .theme(Some(tauri::Theme::Dark))
+    .visible(false)
+    .build()?;
+    configure_main_window(&win);
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(win)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+    } else {
+        // Closed to the tray earlier: the window was destroyed, so build a fresh one.
+        let _ = create_main_window(app);
     }
 }
 
@@ -1220,7 +1314,22 @@ fn perform_toggle_recording(shared: &AppShared, app: &AppHandle, play_sound: boo
     build_state_snapshot(&st)
 }
 
+/// Marks the process as exiting and wakes the `clip-show` thread. `RunEvent::ExitRequested`
+/// prevents the default exit while this flag is clear (tray mode), so every `exit(0)` path
+/// must go through here first.
+fn begin_exit(shared: &AppShared) {
+    let exiting = shared.0.lock().unwrap().exiting.clone();
+    exiting.store(true, Ordering::Relaxed);
+    unsafe {
+        if let Ok(h) = OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
+            let _ = SetEvent(h);
+            let _ = CloseHandle(h);
+        }
+    }
+}
+
 fn shutdown_app(shared: &AppShared, app: &AppHandle) {
+    begin_exit(shared);
     let (old_rec, hotkey_tid, cancel_flag) = {
         let mut st = shared.0.lock().unwrap();
         st.running = false;
@@ -1742,8 +1851,7 @@ async fn pick_folder(
 #[tauri::command]
 async fn list_mics() -> Vec<MicDevice> {
     tauri::async_runtime::spawn_blocking(|| {
-        // WASAPI enumeration needs COM on this worker thread.
-        let _com = Mf::init();
+        // `capture_devices` initializes MTA COM on this worker thread itself.
         audio::capture_devices()
             .into_iter()
             .map(|(id, name)| MicDevice { id, name })
@@ -1792,18 +1900,39 @@ async fn get_clips_count(state: State<'_, AppShared>) -> Result<usize, String> {
 
 #[tauri::command]
 async fn list_clips(app: AppHandle, state: State<'_, AppShared>) -> Result<Vec<ClipEntry>, String> {
+    let shared = state.inner().clone();
     let (dir, share) = {
         let st = state.0.lock().unwrap();
         (st.cfg.output_dir.clone(), ShareCtx::from_state(&app, &st))
     };
     // Canonicalize the folder once per scan: thumbnail keys and entry paths are then already
     // canonical, so no per-file `canonicalize`/`is_file` syscalls are needed.
-    tauri::async_runtime::spawn_blocking(move || match canonicalize_plain(&dir) {
-        Some(dir) => scan_clips(&dir, &share),
-        None => Vec::new(),
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(scan_dir) = canonicalize_plain(&dir) else { return Vec::new() };
+        let clips = scan_clips(&scan_dir, &share);
+        // This scan already enumerated the folder: refresh the cached count here instead of
+        // making the frontend trigger a second, separate folder scan.
+        let mut st = shared.0.lock().unwrap();
+        if st.cfg.output_dir == dir {
+            st.clips_count = clips.len();
+        }
+        clips
     })
     .await
     .map_err(|e| format!("Clip scan failed: {e}"))
+}
+
+/// Preview payload with the clip's cached metadata; `thumb_url` stays `None` when no cover exists.
+fn clip_preview(path: String, thumb_url: Option<String>, meta: &ThumbMeta) -> ClipPreview {
+    ClipPreview {
+        path,
+        thumb_url,
+        duration_ms: Some(meta.duration_ms),
+        width: Some(meta.width),
+        height: Some(meta.height),
+        codec: Some(meta.codec.clone()),
+        error: None,
+    }
 }
 
 #[tauri::command]
@@ -1813,25 +1942,38 @@ async fn get_clip_preview(state: State<'_, AppShared>, path: String) -> Result<C
         (st.cfg.output_dir.clone(), st.thumbs.clone())
     };
     let clip_path = resolve_clip_in_dir(&output_dir, &path)?;
-    tauri::async_runtime::spawn_blocking(move || match read_clip_thumb(&clip_path, &thumbs) {
-        Ok((png, meta)) => ClipPreview {
-            path,
-            thumb_url: png.map(|_| clip_thumb_url(&clip_path, meta.modified_ms)),
-            duration_ms: Some(meta.duration_ms),
-            width: Some(meta.width),
-            height: Some(meta.height),
-            codec: Some(meta.codec),
-            error: None,
-        },
-        Err(e) => ClipPreview {
-            path,
-            thumb_url: None,
-            duration_ms: None,
-            width: None,
-            height: None,
-            codec: None,
-            error: Some(e),
-        },
+    tauri::async_runtime::spawn_blocking(move || {
+        // Fast path: a valid cache entry needs no decode, and for a cached cover the PNG is not read
+        // either — the webview fetches it through the `thumb` protocol.
+        let cached = std::fs::metadata(&clip_path)
+            .ok()
+            .and_then(|m| thumbs.cached(&clip_path, m.len(), modified_ms_of(&m)));
+        if let Some(meta) = cached {
+            let png_p = thumb_cache_paths(&clip_path).1;
+            if !meta.has_thumb {
+                return clip_preview(path, None, &meta);
+            }
+            if png_p.is_file() {
+                touch_thumb_if_stale(&png_p);
+                let url = clip_thumb_url(&clip_path, meta.modified_ms);
+                return clip_preview(path, Some(url), &meta);
+            }
+        }
+        match read_clip_thumb(&clip_path, &thumbs) {
+            Ok((png, meta)) => {
+                let url = png.map(|_| clip_thumb_url(&clip_path, meta.modified_ms));
+                clip_preview(path, url, &meta)
+            }
+            Err(e) => ClipPreview {
+                path,
+                thumb_url: None,
+                duration_ms: None,
+                width: None,
+                height: None,
+                codec: None,
+                error: Some(e),
+            },
+        }
     })
     .await
     .map_err(|e| format!("Preview task failed: {e}"))
@@ -2454,6 +2596,7 @@ async fn install_app(
             )
         })?;
     release_instance_mutex(&shared);
+    begin_exit(&shared);
     let handle = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
@@ -2751,6 +2894,14 @@ fn focus_running_instance() {
             }
             let _ = SetForegroundWindow(hwnd);
         }
+        return;
+    }
+    // The running copy closed its window to the tray, so no HWND exists: ask it to rebuild one.
+    unsafe {
+        if let Ok(h) = OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
+            let _ = SetEvent(h);
+            let _ = CloseHandle(h);
+        }
     }
 }
 
@@ -2823,6 +2974,7 @@ fn main() {
         height_anim_id: 0,
         needs_setup,
         instance_mutex: Some(instance_mutex),
+        exiting: Arc::new(AtomicBool::new(false)),
         updates: UpdateManagerState::new(),
     })));
 
@@ -2830,72 +2982,55 @@ fn main() {
     let event_shared = shared.clone();
     let protocol_shared = shared.clone();
     let window_shared = shared.clone();
+    let shared_exiting = shared.0.lock().unwrap().exiting.clone();
 
     let res = tauri::Builder::default()
         .manage(shared)
-        .register_uri_scheme_protocol("thumb", move |_ctx, request| {
-            thumb_protocol_response(&request, &protocol_shared)
+        .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
+            let shared = protocol_shared.clone();
+            // Decoding a cover can take ~100 ms: never block the webview's protocol thread.
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(thumb_protocol_response(&request, &shared))
+            });
         })
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
                 if is_setup_pending(&window_shared) {
                     // No install yet: nothing runs in the tray, so closing must exit cleanly.
+                    api.prevent_close();
                     shutdown_app(&window_shared, window.app_handle());
-                } else {
-                    let _ = window.hide();
                 }
+                // Otherwise the close proceeds: the webview is destroyed and the tray (which
+                // still records) keeps the process alive until the window is opened again.
             }
         })
         .setup(move |app| {
             let handle = app.handle().clone();
 
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.set_icon(Image::from_bytes(include_bytes!("../../assets/icon/app64.png")).unwrap().to_owned());
-                let _ = win.set_background_color(Some(tauri::window::Color(13, 17, 26, 255)));
-                // Win11 rounded corners without DWM's gray default border.
-                if let Ok(raw_hwnd) = win.hwnd() {
-                    let hwnd = HWND(raw_hwnd.0);
-                    unsafe {
-                        apply_window_icons(hwnd);
-                        let pref = DWMWCP_ROUND.0 as u32;
-                        let _ = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_WINDOW_CORNER_PREFERENCE,
-                            (&pref as *const u32).cast(),
-                            std::mem::size_of::<u32>() as u32,
-                        );
-                        // Match Win11 native border color to the Miku dark-slate window chrome
-                        // (#223B4A, keyed to the #141926 tile / #0D111A background) to prevent
-                        // gray DWM artifacts around the rounded top corners.
-                        let border: u32 = 0x004A_3B22;
-                        let _ = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_BORDER_COLOR,
-                            (&border as *const u32).cast(),
-                            std::mem::size_of::<u32>() as u32,
-                        );
-                        let _ = SetWindowSubclass(
-                            hwnd,
-                            Some(frameless_subclass_proc),
-                            SUBCLASS_FRAMELESS_ID,
-                            0,
-                        );
-                        let _ = SetWindowPos(
-                            hwnd,
-                            None,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                        );
+            // Tray-only launches build no window at all: WebView2, its GPU compositor and the
+            // background thumbnail/DOM refreshes stay dead until the UI is opened.
+            if needs_setup || !background {
+                let _ = create_main_window(&handle);
+            }
+
+            // A second instance has no HWND to focus once the window has been destroyed, so it
+            // signals this event and the running copy reopens its window on demand.
+            if let Ok(ev) = unsafe { CreateEventW(None, false, false, SHOW_EVENT) } {
+                let ev = ev.0 as usize;
+                let exiting = setup_shared.0.lock().unwrap().exiting.clone();
+                let show_handle = handle.clone();
+                let _ = std::thread::Builder::new().name("clip-show".into()).spawn(move || {
+                    let ev = HANDLE(ev as *mut std::ffi::c_void);
+                    loop {
+                        unsafe { WaitForSingleObject(ev, INFINITE) };
+                        if exiting.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let h = show_handle.clone();
+                        let _ = show_handle.run_on_main_thread(move || show_main_window(&h));
                     }
-                }
-                if needs_setup || !background {
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                }
+                    let _ = unsafe { CloseHandle(ev) };
+                });
             }
 
             let save_clip = MenuItem::with_id(app, "save_clip", "Save clip now", cfg.enabled && !needs_setup, None::<&str>)?;
@@ -3052,10 +3187,22 @@ fn main() {
             check_for_updates,
             apply_update,
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if let Err(e) = res {
-        log(&format!("Tauri error: {e}"));
+    match res {
+        Ok(app) => {
+            // The window can be destroyed while the recorder keeps running, so "exit when the
+            // last window closes" is replaced by waiting for `begin_exit`.
+            let run_exiting = shared_exiting.clone();
+            app.run(move |_app, event| {
+                if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                    if !run_exiting.load(Ordering::Relaxed) {
+                        api.prevent_exit();
+                    }
+                }
+            });
+        }
+        Err(e) => log(&format!("Tauri error: {e}")),
     }
 
     // Ensure recorder and hotkeys are stopped cleanly on exit.
